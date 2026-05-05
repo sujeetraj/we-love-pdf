@@ -1,68 +1,161 @@
 # We Love PDF
 
-Internal web application for day-to-day PDF work on a private network. It has no login, keeps uploaded/generated files only in session-scoped temporary folders, and deletes them when the browser session is closed or when the server-side TTL cleanup runs.
+We Love PDF is an internal web application for common PDF operations on a trusted private network. It is designed for day-to-day staff usage without login, without persistent document storage, and with all PDF processing handled by open-source components.
+
+Uploaded files and generated outputs live only in session-scoped temporary folders. The browser requests cleanup when the session closes, and the server also removes expired temporary sessions by TTL.
 
 ## Features
 
-- Merge PDFs in a chosen order
-- Split selected pages into independent PDF files
-- Compress PDFs with quality-preserving cleanup
-- Organize/reorder/delete pages using draggable thumbnails
-- Redact searched text and selected page areas
-- Edit PDFs by adding text, highlights, comments, rectangles, and circles
+- Merge PDFs by arranging whole files in the required order
+- Split PDFs using page ranges or selected pages
+- Compress PDFs while preserving readable output quality
+- Organize PDFs by dragging pages, deleting pages, rotating pages, and adding blank pages
+- Redact PDFs by searching text, optionally using OCR for scanned pages, and permanently applying redactions
+- Edit PDFs in a viewer-style workspace with:
+  - Text and comment objects
+  - Highlights, rectangles, circles, and image insertion
+  - Drag-to-move objects
+  - Resize handles
+  - Delete or Backspace removal for selected objects
+  - Font family, size, colour, background fill, bold, italic, and underline controls
 
-Each home-page tool opens its own workspace at `/tool/<name>`. Users upload PDFs there, preview page thumbnails, drag/drop or remove pages, and then click Generate to produce the output.
+## Application Flow
 
-## Open-source stack
+1. Open the home page and choose a PDF tool.
+2. Upload one or more PDFs depending on the selected tool.
+3. Preview the PDF or generated page thumbnails.
+4. Arrange, edit, redact, split, compress, or organize as needed.
+5. Click the generate/save action to download the output.
+6. Temporary session data is deleted on browser close or by server TTL cleanup.
 
-- Python 3.11+
+Tool pages are available at:
+
+```text
+/tool/merge
+/tool/split
+/tool/compress
+/tool/organize
+/tool/redact
+/tool/edit
+```
+
+## Technology Stack
+
+- Python
 - Flask
 - PyMuPDF
-- Tesseract OCR for scanned PDF redaction searches in container deployment
-- SortableJS served locally for drag/drop thumbnails
+- Gunicorn
+- Tesseract OCR in the container image
+- SortableJS served locally for drag and drop
+- Plain HTML, CSS, and JavaScript
 
-## Run Locally
+No external CDN is required at runtime.
+
+## Local Development
+
+Create a virtual environment and install dependencies:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+Run the application:
+
+```bash
 python app.py
 ```
 
-Open `http://127.0.0.1:8000`.
+Open:
 
-## Internal Deployment
-
-```bash
-gunicorn -w 2 -b 0.0.0.0:8000 app:app
+```text
+http://127.0.0.1:8000
 ```
 
-Or run the container:
+Run validation:
+
+```bash
+node --check static/app.js
+python -m unittest tests.smoke_test
+```
+
+## Container Deployment
+
+Build and run:
 
 ```bash
 docker build -t we-love-pdf .
 docker run --rm -p 8000:8000 -e MAX_UPLOAD_MB=150 we-love-pdf
 ```
 
-Place it behind your internal reverse proxy with HTTPS enabled. Recommended controls:
+The container runs Gunicorn and includes Tesseract OCR English language data for scanned PDF redaction search.
 
-- Restrict access to internal network ranges at the firewall or reverse proxy.
-- Set `MAX_UPLOAD_MB` to match your policy.
-- Put `APP_TEMP_ROOT` on encrypted local disk.
-- Keep `SESSION_TTL_MINUTES` low for shared machines.
-- Forward access logs to your internal log system.
+## Internal Network Deployment
 
-## Environment
+For a direct server deployment:
 
-| Variable | Default | Purpose |
+```bash
+gunicorn -w 2 -b 0.0.0.0:8000 app:app
+```
+
+Recommended production placement:
+
+- Run behind an internal reverse proxy with HTTPS.
+- Restrict access to internal network ranges at the firewall or proxy.
+- Keep the application off the public internet unless authentication and stronger perimeter controls are added.
+- Store temporary files on encrypted local disk.
+- Forward application and reverse-proxy access logs to the internal logging platform.
+- Tune worker count and upload size based on expected file sizes and concurrency.
+
+## Configuration
+
+| Variable | Default | Description |
 | --- | --- | --- |
-| `MAX_UPLOAD_MB` | `150` | Maximum upload size |
-| `APP_TEMP_ROOT` | OS temp directory | Root folder for ephemeral session files |
-| `SESSION_TTL_MINUTES` | `60` | Age before temp sessions are removed |
-| `TESSDATA_PREFIX` | System default | Tesseract OCR data path for scanned PDFs |
-| `PORT` | `8000` | Development server port |
+| `MAX_UPLOAD_MB` | `150` | Maximum request upload size in MB |
+| `APP_TEMP_ROOT` | OS temp directory + `we-love-pdf` | Root directory for temporary session folders |
+| `SESSION_TTL_MINUTES` | `60` | Time before temporary sessions are eligible for cleanup |
+| `TESSDATA_PREFIX` | System default | Tesseract language data path for OCR |
+| `PORT` | `8000` | Port used by the Flask development server |
 
 ## Data Handling
 
-Uploaded PDFs and generated outputs are written only to temporary per-session folders. The browser calls `/api/session/cleanup` via `sendBeacon` on page unload. The server also deletes expired sessions before each request. Only standard request/application logs should persist.
+The application does not use a database and does not intentionally retain uploaded PDFs or generated outputs.
+
+- Files are written under a UUID session directory.
+- The browser calls `/api/session/cleanup` with `sendBeacon` when the page unloads.
+- The server deletes expired sessions before handling requests.
+- Generated files are returned as downloads.
+- Only application/request logs should persist outside the temporary workspace.
+
+## Security Notes
+
+- No login is included by design for trusted internal deployment.
+- PDF files are processed server-side with PyMuPDF.
+- Security headers are applied by the Flask app, including content type, frame, referrer, permissions, cache, and CSP controls.
+- Uploaded files are validated as PDFs before processing.
+- Runtime scripts and vendor assets are served locally.
+- OCR is opt-in for redaction searches.
+
+## Project Structure
+
+```text
+.
+├── app.py
+├── Dockerfile
+├── requirements.txt
+├── static/
+│   ├── app.js
+│   ├── styles.css
+│   └── vendor/
+├── templates/
+│   └── index.html
+└── tests/
+    └── smoke_test.py
+```
+
+## Repository
+
+```text
+https://github.com/sujeetraj/we-love-pdf
+```
