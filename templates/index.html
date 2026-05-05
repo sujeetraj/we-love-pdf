@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ app_name }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <script defer src="{{ url_for('static', filename='vendor/Sortable.min.js') }}"></script>
+    <script defer src="{{ url_for('static', filename='app.js') }}"></script>
+  </head>
+  <body data-active-tool="{{ active_tool }}">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="We Love PDF home">
+        <span class="brand-mark">PDF</span>
+        <span>We Love PDF</span>
+      </a>
+      <nav class="nav" aria-label="Primary">
+        <a href="/#tools">All PDF tools</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="home-view" id="homeView">
+        <div class="hero">
+          <h1>Every internal PDF tool in one place</h1>
+          <p>Merge, split, compress, organize, redact, and edit PDFs inside your private network with temporary session storage only.</p>
+        </div>
+
+        <section class="tool-band" id="tools">
+          <div class="tabs" role="tablist" aria-label="PDF tool categories">
+            <button class="tab active" data-filter="all" type="button">All</button>
+            <button class="tab" data-filter="organize" type="button">Organize PDF</button>
+            <button class="tab" data-filter="optimize" type="button">Optimize PDF</button>
+            <button class="tab" data-filter="edit" type="button">Edit PDF</button>
+            <button class="tab" data-filter="security" type="button">PDF Security</button>
+          </div>
+
+          <div class="tool-grid">
+            <a class="tool-card" href="/tool/merge" data-category="organize">
+              <span class="tool-icon merge"></span>
+              <strong>Merge PDF</strong>
+              <span>Combine PDFs in the order you want.</span>
+            </a>
+            <a class="tool-card" href="/tool/split" data-category="organize">
+              <span class="tool-icon split"></span>
+              <strong>Split PDF</strong>
+              <span>Separate pages into independent PDF files.</span>
+            </a>
+            <a class="tool-card" href="/tool/compress" data-category="optimize">
+              <span class="tool-icon compress"></span>
+              <strong>Compress PDF</strong>
+              <span>Reduce file size while preserving quality.</span>
+            </a>
+            <a class="tool-card" href="/tool/organize" data-category="organize">
+              <span class="tool-icon organize"></span>
+              <strong>Organize PDF</strong>
+              <span>Drag thumbnails to reorder or remove pages.</span>
+            </a>
+            <a class="tool-card" href="/tool/redact" data-category="security">
+              <span class="tool-icon redact"></span>
+              <strong>Redact PDF</strong>
+              <span>Permanently remove sensitive text.</span>
+            </a>
+            <a class="tool-card" href="/tool/edit" data-category="edit">
+              <span class="tool-icon edit"></span>
+              <strong>PDF Editor</strong>
+              <span>Add text, shapes, comments, and highlights.</span>
+            </a>
+          </div>
+        </section>
+
+      </section>
+
+      <section class="tool-view" id="toolView" hidden>
+        <div class="tool-shell">
+          <aside class="tool-sidebar">
+            <a class="back-link" href="/">All tools</a>
+            <p class="eyebrow">Selected tool</p>
+            <h1 id="toolTitle">PDF Tool</h1>
+            <p id="toolDescription">Upload PDFs to preview pages before generating the output.</p>
+
+            <label class="dropzone compact">
+              <input id="toolFiles" type="file" accept="application/pdf" multiple>
+              <span>Choose PDFs</span>
+              <small id="uploadHint">Drag files here or choose from your device.</small>
+            </label>
+
+            <div class="uploaded-files-panel" id="uploadedFilesPanel" hidden>
+              <div class="uploaded-files-head">
+                <strong>Files:</strong>
+                <button id="uploadedResetBtn" type="button">Reset all</button>
+              </div>
+              <div class="uploaded-file-list" id="uploadedFileList"></div>
+              <button class="uploaded-add-file" id="uploadedAddFileBtn" type="button">+ Add more files</button>
+            </div>
+
+            <div class="tool-options" id="toolOptions">
+              <div class="option-split">
+                <div class="split-tabs" role="tablist" aria-label="Split mode">
+                  <button class="split-tab active" id="splitRangeTab" type="button" data-split-mode="range">Range</button>
+                  <button class="split-tab" id="splitPagesTab" type="button" data-split-mode="pages">Pages</button>
+                </div>
+
+                <div class="split-panel" id="splitRangePanel">
+                  <p class="option-label">Range mode:</p>
+                  <div class="segmented">
+                    <button class="segment active" id="customRangeBtn" type="button" data-range-mode="custom">Custom</button>
+                    <button class="segment" id="fixedRangeBtn" type="button" data-range-mode="fixed">Fixed</button>
+                  </div>
+                  <div id="customRangeControls">
+                    <div class="range-list" id="rangeList"></div>
+                    <button class="ghost wide action-ghost" id="addRangeBtn" type="button">+ Add Range</button>
+                  </div>
+                  <label class="field" id="fixedRangeControls" hidden>
+                    <span>Split into page ranges of</span>
+                    <input id="fixedRangeSize" type="number" min="1" value="1">
+                  </label>
+                  <label class="check-row">
+                    <input id="mergeRanges" type="checkbox">
+                    <span>Merge all ranges in one PDF file</span>
+                  </label>
+                </div>
+
+                <div class="split-panel" id="splitPagesPanel" hidden>
+                  <p class="option-label">Extract mode:</p>
+                  <div class="segmented">
+                    <button class="segment active" id="extractAllBtn" type="button" data-pages-mode="all">Extract all pages</button>
+                    <button class="segment" id="extractSelectedBtn" type="button" data-pages-mode="selected">Select pages</button>
+                  </div>
+                </div>
+              </div>
+
+              <label class="field option-compress">
+                <span>Compression level</span>
+                <select id="compressLevel">
+                  <option value="balanced">Balanced</option>
+                  <option value="maximum">Maximum cleanup</option>
+                </select>
+              </label>
+
+              <div class="option-redact redact-controls">
+                <label class="field">
+                  <span>Search text</span>
+                  <input id="redactSearch" type="search" placeholder="Search text">
+                </label>
+                <label class="check-row">
+                  <input id="redactOcr" type="checkbox">
+                  <span>Use OCR when text is not selectable</span>
+                </label>
+                <button class="ghost wide action-ghost" id="redactSearchBtn" type="button">Mark text</button>
+                <div class="marked-head">
+                  <strong>Marked for redaction</strong>
+                  <button id="clearMarksBtn" type="button">Clear all</button>
+                </div>
+                <div class="marked-empty" id="markedEmpty">Select and search text to start redacting sensitive content.</div>
+                <div class="marked-list" id="markedList"></div>
+              </div>
+
+              <label class="field option-edit">
+                <span>Action</span>
+                <select id="editAction">
+                  <option value="text">Text</option>
+                  <option value="highlight">Highlight</option>
+                  <option value="comment">Comment</option>
+                  <option value="rectangle">Rectangle</option>
+                  <option value="circle">Circle</option>
+                </select>
+              </label>
+              <label class="field option-edit">
+                <span>Text or comment</span>
+                <textarea id="editText" rows="3" placeholder="Text to add"></textarea>
+              </label>
+              <div class="edit-format-panel option-edit">
+                <div class="field-grid">
+                  <label class="field"><span>Font</span><select id="editFontFamily"><option value="helvetica">Helvetica</option><option value="times">Times</option><option value="courier">Courier</option></select></label>
+                  <label class="field"><span>Size</span><input id="editFontSize" type="number" min="6" max="96" value="14"></label>
+                  <label class="field"><span>Text colour</span><input id="editTextColor" type="color" value="#d11f1f"></label>
+                  <label class="field"><span>Background</span><input id="editBgColor" type="color" value="#ffffff"></label>
+                </div>
+                <div class="format-buttons" aria-label="Text formatting">
+                  <button id="editBold" type="button" data-format-toggle="bold">B</button>
+                  <button id="editItalic" type="button" data-format-toggle="italic">I</button>
+                  <button id="editUnderline" type="button" data-format-toggle="underline">U</button>
+                  <label><input id="editBgEnabled" type="checkbox"> Fill background</label>
+                </div>
+              </div>
+              <div class="field-grid option-edit">
+                <label class="field"><span>Page</span><input id="editPage" type="number" min="1" value="1"></label>
+                <label class="field"><span>X</span><input id="editX" type="number" value="72"></label>
+                <label class="field"><span>Y</span><input id="editY" type="number" value="72"></label>
+                <label class="field"><span>W</span><input id="editW" type="number" value="180"></label>
+                <label class="field"><span>H</span><input id="editH" type="number" value="40"></label>
+              </div>
+            </div>
+
+            <button class="primary wide" id="generateBtn" type="button">Generate</button>
+            <button class="ghost wide" id="clearPreviewBtn" type="button">Clear preview</button>
+            <div class="status" id="status"></div>
+          </aside>
+
+          <section class="preview-workspace">
+            <div class="preview-head">
+              <div>
+                <p class="eyebrow">PDF preview</p>
+                <h2 id="previewTitle">Arrange pages before generating</h2>
+              </div>
+              <span class="page-count" id="pageCount">0 pages</span>
+            </div>
+            <div class="preview-empty" id="previewEmpty">
+              <strong>Upload PDFs to render thumbnails</strong>
+              <span id="previewEmptyText">Then drag pages into order, remove unwanted pages, and click Generate.</span>
+            </div>
+            <div class="thumb-grid preview-grid" id="previewGrid"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
