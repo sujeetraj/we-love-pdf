@@ -1,6 +1,8 @@
+import base64
 import io
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 import fitz
@@ -13,6 +15,22 @@ def sample_pdf(text: str, pages: int = 1) -> bytes:
     for index in range(pages):
         page = doc.new_page()
         page.insert_text((72, 72), f"{text} page {index + 1}")
+    data = doc.tobytes(garbage=4, deflate=True)
+    doc.close()
+    return data
+
+
+def table_pdf_with_image() -> bytes:
+    red_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAAC0lEQVR4nGP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+    )
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "Name", fontname="Helvetica-Bold", fontsize=12)
+    page.insert_text((220, 72), "Amount", fontname="Helvetica-Bold", fontsize=12)
+    page.insert_text((72, 96), "Alice", fontsize=12)
+    page.insert_text((220, 96), "100", fontsize=12)
+    page.insert_image(fitz.Rect(72, 130, 122, 180), stream=red_png)
     data = doc.tobytes(garbage=4, deflate=True)
     doc.close()
     return data
@@ -219,6 +237,39 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(redacted.status_code, 200)
         with fitz.open(stream=redacted.data, filetype="pdf") as doc:
             self.assertNotIn("NAME", doc[0].get_text())
+
+    def test_generate_excel_from_preview(self):
+        upload = self.client.post(
+            "/api/document",
+            data={"sessionId": self.session_id, "file": (io.BytesIO(table_pdf_with_image()), "report.pdf")},
+            content_type="multipart/form-data",
+        )
+        document_id = upload.get_json()["documentId"]
+
+        converted = self.client.post(
+            "/api/generate/excel",
+            json={
+                "sessionId": self.session_id,
+                "pages": [{"documentId": document_id, "page": 1}],
+                "options": {},
+            },
+        )
+        self.assertEqual(converted.status_code, 200)
+        self.assertEqual(
+            converted.mimetype,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        self.assertIn("converted-report.xlsx", converted.headers["Content-Disposition"])
+        with zipfile.ZipFile(io.BytesIO(converted.data)) as workbook:
+            sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+            styles = workbook.read("xl/styles.xml").decode("utf-8")
+            names = workbook.namelist()
+        self.assertIn('<c r="A1" s="1" t="inlineStr"><is><t>Name</t></is></c>', sheet)
+        self.assertIn('<c r="B1" s="1" t="inlineStr"><is><t>Amount</t></is></c>', sheet)
+        self.assertIn('<c r="A2" s="0" t="inlineStr"><is><t>Alice</t></is></c>', sheet)
+        self.assertIn("<b/>", styles)
+        self.assertIn("xl/drawings/drawing1.xml", names)
+        self.assertIn("xl/media/image1.png", names)
 
     def test_invalid_pdf_error_is_generic(self):
         response = self.client.post(

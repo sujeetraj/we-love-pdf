@@ -257,6 +257,23 @@ textarea {
   transform: rotate(-35deg);
 }
 
+.excel::before {
+  width: 28px;
+  height: 28px;
+  left: 10px;
+  top: 10px;
+  border-radius: 3px;
+}
+
+.excel::after {
+  width: 18px;
+  height: 4px;
+  left: 15px;
+  top: 22px;
+  background: #fff;
+  box-shadow: 0 -7px #fff, 0 7px #fff;
+}
+
 .tool-view {
   padding: 24px;
 }

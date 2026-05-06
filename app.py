@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import io
 import logging
 import os
@@ -9,6 +10,7 @@ import time
 import uuid
 import zipfile
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import fitz
 from flask import Flask, abort, g, jsonify, render_template, request, send_file
@@ -23,7 +25,7 @@ MAX_OCR_PAGES = int(os.environ.get("MAX_OCR_PAGES", "25"))
 MAX_OPERATION_SECONDS = int(os.environ.get("MAX_OPERATION_SECONDS", "120"))
 TEMP_ROOT = Path(os.environ.get("APP_TEMP_ROOT", tempfile.gettempdir())) / "we-love-pdf"
 ALLOWED_EXTENSIONS = {".pdf"}
-TOOLS = {"merge", "split", "compress", "organize", "redact", "edit"}
+TOOLS = {"merge", "split", "compress", "organize", "redact", "edit", "excel"}
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
@@ -33,6 +35,22 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger(APP_NAME)
+
+
+def log_fingerprint(value: object, prefix: str) -> str:
+    text = str(value or "")
+    if not text:
+        return f"{prefix}:empty"
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"{prefix}:{digest}"
+
+
+def log_session_id(session_id: object) -> str:
+    return log_fingerprint(session_id, "session")
+
+
+def log_filename(name: object) -> str:
+    return log_fingerprint(name, "file")
 
 
 def ensure_temp_root() -> None:
@@ -127,12 +145,16 @@ def output_path(target_dir: Path, name: str) -> Path:
 
 
 def send_pdf(path: Path, download_name: str):
+    return send_download(path, download_name, "application/pdf")
+
+
+def send_download(path: Path, download_name: str, mimetype: str):
     data = io.BytesIO(path.read_bytes())
     return send_file(
         data,
         as_attachment=True,
         download_name=download_name,
-        mimetype="application/pdf",
+        mimetype=mimetype,
         max_age=0,
     )
 
@@ -187,7 +209,7 @@ def tool_page(tool: str):
 @app.post("/api/session")
 def create_session():
     session_id, _path = new_session_dir()
-    logger.info("session.created id=%s", session_id)
+    logger.info("session.created id=%s", log_session_id(session_id))
     return jsonify({"sessionId": session_id})
 
 
@@ -197,7 +219,7 @@ def cleanup_session():
     session_id = data.get("sessionId", "")
     if re.fullmatch(r"[a-f0-9-]{36}", session_id or ""):
         shutil.rmtree(TEMP_ROOT / session_id, ignore_errors=True)
-        logger.info("session.cleaned id=%s", session_id)
+        logger.info("session.cleaned id=%s", log_session_id(session_id))
     return ("", 204)
 
 
@@ -215,11 +237,11 @@ def merge_pdfs():
         with fitz.open(path) as doc:
             page_count = doc.page_count
             result.insert_pdf(doc)
-        logger.info("merge.input index=%s pages=%s name=%s", index, page_count, upload.filename)
+        logger.info("merge.input index=%s pages=%s name=%s", index, page_count, log_filename(upload.filename))
     out = output_path(workdir, "merged.pdf")
     result.save(out, garbage=4, deflate=True, clean=True)
     result.close()
-    logger.info("merge.output session=%s file=%s", sid, out.name)
+    logger.info("merge.output session=%s file=%s", log_session_id(sid), log_filename(out.name))
     return send_pdf(out, "we-love-pdf-merged.pdf")
 
 
@@ -270,7 +292,12 @@ def compress_pdf():
         if level == "maximum":
             save_kwargs.update({"deflate_images": True, "deflate_fonts": True})
         doc.save(out, **save_kwargs)
-    logger.info("compress.output session=%s input_bytes=%s output_bytes=%s", sid, path.stat().st_size, out.stat().st_size)
+    logger.info(
+        "compress.output session=%s input_bytes=%s output_bytes=%s",
+        log_session_id(sid),
+        path.stat().st_size,
+        out.stat().st_size,
+    )
     return send_pdf(out, "we-love-pdf-compressed.pdf")
 
 
@@ -385,6 +412,355 @@ def organized_document_from_items(workdir: Path, items: list[dict]) -> fitz.Docu
     return result
 
 
+def span_styles(page: fitz.Page) -> list[dict]:
+    spans = []
+    for block in page.get_text("dict").get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                spans.append(
+                    {
+                        "rect": fitz.Rect(span.get("bbox", (0, 0, 0, 0))),
+                        "style": excel_style_from_flags(int(span.get("flags", 0))),
+                    }
+                )
+    return spans
+
+
+def excel_style_from_flags(flags: int) -> int:
+    bold = bool(flags & 16)
+    italic = bool(flags & 2)
+    if bold and italic:
+        return 3
+    if bold:
+        return 1
+    if italic:
+        return 2
+    return 0
+
+
+def style_for_word(spans: list[dict], x: float, y: float) -> int:
+    point = fitz.Point(x, y)
+    for span in spans:
+        if point in span["rect"]:
+            return int(span["style"])
+    return 0
+
+
+def cluster_columns(x_positions: list[float]) -> list[float]:
+    columns: list[float] = []
+    for x in sorted(x_positions):
+        if not columns or abs(x - columns[-1]) > 24:
+            columns.append(x)
+        else:
+            columns[-1] = (columns[-1] + x) / 2
+    return columns or [0]
+
+
+def nearest_column(columns: list[float], x: float) -> int:
+    return min(range(len(columns)), key=lambda index: abs(columns[index] - x)) + 1
+
+
+def worksheet_cells_from_page(page: fitz.Page) -> tuple[list[list[dict]], list[float]]:
+    words = sorted(page.get_text("words"), key=lambda word: (round(word[1], 1), word[0]))
+    styles = span_styles(page)
+    grouped_rows: list[list[dict]] = []
+    current_y: float | None = None
+    for word in words:
+        check_operation_budget()
+        x0, y0, x1, y1, text = word[:5]
+        midpoint_y = (float(y0) + float(y1)) / 2
+        if current_y is None or abs(midpoint_y - current_y) > 4:
+            grouped_rows.append([])
+            current_y = midpoint_y
+        grouped_rows[-1].append(
+            {
+                "x0": float(x0),
+                "x1": float(x1),
+                "text": str(text),
+                "style": style_for_word(styles, (float(x0) + float(x1)) / 2, midpoint_y),
+            }
+        )
+
+    row_chunks: list[list[dict]] = []
+    x_positions: list[float] = []
+    for row in grouped_rows:
+        chunks: list[dict] = []
+        current_words: list[str] = []
+        current_x = 0.0
+        current_style = 0
+        previous_x1: float | None = None
+        for word in sorted(row, key=lambda item: item["x0"]):
+            if previous_x1 is not None and word["x0"] - previous_x1 > 18 and current_words:
+                chunks.append({"x": current_x, "text": " ".join(current_words), "style": current_style})
+                x_positions.append(current_x)
+                current_words = []
+                current_style = 0
+            if not current_words:
+                current_x = word["x0"]
+                current_style = word["style"]
+            else:
+                current_style = max(current_style, word["style"])
+            current_words.append(word["text"])
+            previous_x1 = word["x1"]
+        if current_words:
+            chunks.append({"x": current_x, "text": " ".join(current_words), "style": current_style})
+            x_positions.append(current_x)
+        if chunks:
+            row_chunks.append(chunks)
+
+    if not row_chunks:
+        return [[{"col": 1, "text": "No selectable text found on this page", "style": 0}]], [0]
+
+    columns = cluster_columns(x_positions)
+    sparse_rows: list[list[dict]] = []
+    for row in row_chunks:
+        sparse_rows.append(
+            [
+                {
+                    "col": nearest_column(columns, cell["x"]),
+                    "text": cell["text"],
+                    "style": cell["style"],
+                }
+                for cell in row
+            ]
+        )
+    return sparse_rows, columns
+
+
+def extract_page_images(doc: fitz.Document, page: fitz.Page) -> list[dict]:
+    images = []
+    for image in page.get_images(full=True):
+        check_operation_budget()
+        xref = image[0]
+        try:
+            pix = fitz.Pixmap(doc, xref)
+            if pix.n - pix.alpha > 3:
+                pix = fitz.Pixmap(fitz.csRGB, pix)
+            data = pix.tobytes("png")
+        except Exception:
+            logger.info("excel.image_skipped xref=%s", xref)
+            continue
+        for rect in page.get_image_rects(xref):
+            images.append({"rect": rect, "bytes": data, "extension": "png"})
+    return images
+
+
+def column_name(index: int) -> str:
+    name = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(65 + remainder) + name
+    return name
+
+
+def worksheet_xml(rows: list[list[dict]], column_count: int, has_drawing: bool) -> str:
+    cols = "".join(f'<col min="{index}" max="{index}" width="18" customWidth="1"/>' for index in range(1, column_count + 1))
+    row_xml = []
+    for row_index, row in enumerate(rows, start=1):
+        cells = []
+        for cell in row:
+            ref = f"{column_name(int(cell['col']))}{row_index}"
+            style = int(cell.get("style", 0))
+            cells.append(f'<c r="{ref}" s="{style}" t="inlineStr"><is><t>{escape(str(cell["text"]))}</t></is></c>')
+        row_xml.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+    drawing = '<drawing r:id="rIdDrawing1"/>' if has_drawing else ""
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f"<cols>{cols}</cols>"
+        f'<sheetData>{"".join(row_xml)}</sheetData>{drawing}'
+        "</worksheet>"
+    )
+
+
+def pdf_rect_to_excel_anchor(rect: fitz.Rect) -> dict:
+    emu_per_pixel = 9525
+    col_px = 96
+    row_px = 20
+    left = rect.x0 * 96 / 72
+    top = rect.y0 * 96 / 72
+    right = rect.x1 * 96 / 72
+    bottom = rect.y1 * 96 / 72
+    return {
+        "from_col": int(left // col_px),
+        "from_col_off": int((left % col_px) * emu_per_pixel),
+        "from_row": int(top // row_px),
+        "from_row_off": int((top % row_px) * emu_per_pixel),
+        "to_col": int(right // col_px),
+        "to_col_off": int((right % col_px) * emu_per_pixel),
+        "to_row": int(bottom // row_px),
+        "to_row_off": int((bottom % row_px) * emu_per_pixel),
+    }
+
+
+def drawing_xml(images: list[dict]) -> str:
+    anchors = []
+    for index, image in enumerate(images, start=1):
+        anchor = pdf_rect_to_excel_anchor(image["rect"])
+        anchors.append(
+            '<xdr:twoCellAnchor editAs="oneCell">'
+            f'<xdr:from><xdr:col>{anchor["from_col"]}</xdr:col><xdr:colOff>{anchor["from_col_off"]}</xdr:colOff><xdr:row>{anchor["from_row"]}</xdr:row><xdr:rowOff>{anchor["from_row_off"]}</xdr:rowOff></xdr:from>'
+            f'<xdr:to><xdr:col>{anchor["to_col"]}</xdr:col><xdr:colOff>{anchor["to_col_off"]}</xdr:colOff><xdr:row>{anchor["to_row"]}</xdr:row><xdr:rowOff>{anchor["to_row_off"]}</xdr:rowOff></xdr:to>'
+            '<xdr:pic>'
+            f'<xdr:nvPicPr><xdr:cNvPr id="{index}" name="Image {index}"/><xdr:cNvPicPr/></xdr:nvPicPr>'
+            f'<xdr:blipFill><a:blip r:embed="rId{index}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
+            '<xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>'
+            '</xdr:pic><xdr:clientData/></xdr:twoCellAnchor>'
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'{"".join(anchors)}</xdr:wsDr>'
+    )
+
+
+def drawing_rels_xml(images: list[dict], first_media_index: int) -> str:
+    rels = []
+    for index, image in enumerate(images, start=1):
+        media_index = first_media_index + index - 1
+        rels.append(
+            f'<Relationship Id="rId{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image{media_index}.{image["extension"]}"/>'
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'{"".join(rels)}</Relationships>'
+    )
+
+
+def worksheet_rels_xml(drawing_index: int) -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rIdDrawing1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing{drawing_index}.xml"/>'
+        "</Relationships>"
+    )
+
+
+def original_upload_stem(path: Path) -> str:
+    parts = path.name.split("-", 2)
+    original = parts[2] if len(parts) == 3 else path.name
+    return secure_filename(Path(original).stem or "document")
+
+
+def create_excel_from_refs(workdir: Path, refs: list[dict]) -> tuple[Path, str]:
+    first_path = find_document(workdir, str(refs[0].get("documentId", "")))
+    original_stem = original_upload_stem(first_path)
+    out = output_path(workdir, f"converted-{original_stem}.xlsx")
+    sheets: list[dict] = []
+    for index, ref in enumerate(refs, start=1):
+        check_operation_budget()
+        document_id = str(ref.get("documentId", ""))
+        page_number = int(ref.get("page", 0))
+        path = find_document(workdir, document_id)
+        with fitz.open(path) as doc:
+            validate_pdf_page_limit(doc.page_count)
+            if page_number < 1 or page_number > doc.page_count:
+                abort(400, "Invalid page in preview")
+            page = doc[page_number - 1]
+            cells, columns = worksheet_cells_from_page(page)
+            sheets.append(
+                {
+                    "name": f"Page {index}",
+                    "cells": cells,
+                    "column_count": max(len(columns), 1),
+                    "images": extract_page_images(doc, page),
+                }
+            )
+
+    sheet_defs = "".join(
+        f'<sheet name="{escape(sheet["name"])}" sheetId="{index}" r:id="rId{index}"/>'
+        for index, sheet in enumerate(sheets, start=1)
+    )
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f"<sheets>{sheet_defs}</sheets>"
+        "</workbook>"
+    )
+    rels_xml = "".join(
+        f'<Relationship Id="rId{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{index}.xml"/>'
+        for index in range(1, len(sheets) + 1)
+    )
+    rels_xml += '<Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f"{rels_xml}</Relationships>"
+    )
+    sheet_overrides = "".join(
+        f'<Override PartName="/xl/worksheets/sheet{index}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        for index in range(1, len(sheets) + 1)
+    )
+    drawing_overrides = "".join(
+        f'<Override PartName="/xl/drawings/drawing{index}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>'
+        for index, sheet in enumerate(sheets, start=1)
+        if sheet["images"]
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Default Extension="png" ContentType="image/png"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        f"{sheet_overrides}{drawing_overrides}</Types>"
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        "</Relationships>"
+    )
+    styles_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<fonts count="4">'
+        '<font><sz val="11"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="11"/><name val="Calibri"/></font>'
+        '<font><i/><sz val="11"/><name val="Calibri"/></font>'
+        '<font><b/><i/><sz val="11"/><name val="Calibri"/></font>'
+        '</fonts>'
+        '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>'
+        '<borders count="1"><border/></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="4">'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '<xf numFmtId="0" fontId="3" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '</cellXfs>'
+        "</styleSheet>"
+    )
+
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("xl/workbook.xml", workbook_xml)
+        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        archive.writestr("xl/styles.xml", styles_xml)
+        media_index = 1
+        for index, sheet in enumerate(sheets, start=1):
+            images = sheet["images"]
+            archive.writestr(
+                f"xl/worksheets/sheet{index}.xml",
+                worksheet_xml(sheet["cells"], int(sheet["column_count"]), bool(images)),
+            )
+            if images:
+                archive.writestr(f"xl/worksheets/_rels/sheet{index}.xml.rels", worksheet_rels_xml(index))
+                archive.writestr(f"xl/drawings/drawing{index}.xml", drawing_xml(images))
+                archive.writestr(f"xl/drawings/_rels/drawing{index}.xml.rels", drawing_rels_xml(images, media_index))
+                for image in images:
+                    archive.writestr(f"xl/media/image{media_index}.{image['extension']}", image["bytes"])
+                    media_index += 1
+    return out, f"converted-{original_stem}.xlsx"
+
+
 def document_from_range(workdir: Path, document_id: str, start: int, end: int) -> fitz.Document:
     path = find_document(workdir, document_id)
     result = fitz.open()
@@ -418,8 +794,9 @@ def search_document_text(path: Path, term: str, use_ocr: bool = False) -> tuple[
                     textpage = page.get_textpage_ocr(language="eng", full=True)
                     rects = page.search_for(term, textpage=textpage)
                     used_ocr = bool(rects)
-                except Exception as exc:
-                    ocr_warning = f"OCR unavailable or failed: {exc}"
+                except Exception:
+                    logger.info("ocr.unavailable file=%s page=%s", log_filename(path.name), page_index + 1)
+                    ocr_warning = "OCR is unavailable for this document. Search selectable text or try again without OCR."
             for rect in rects:
                 matches.append(
                     {
@@ -586,7 +963,7 @@ def generate_from_preview(tool: str):
         document_refs = selected_document_refs(data, workdir)
         result = document_from_document_refs(workdir, document_refs)
         out = save_generated_pdf(result, workdir, "merged.pdf")
-        logger.info("generate.output tool=%s session=%s documents=%s", tool, sid, len(document_refs))
+        logger.info("generate.output tool=%s session=%s documents=%s", tool, log_session_id(sid), len(document_refs))
         return send_pdf(out, "we-love-pdf-merged.pdf")
 
     if tool == "split":
@@ -635,10 +1012,20 @@ def generate_from_preview(tool: str):
             abort(400, "Invalid organizer items")
         result = organized_document_from_items(workdir, items)
         out = save_generated_pdf(result, workdir, "organized.pdf")
-        logger.info("generate.output tool=%s session=%s items=%s", tool, sid, len(items))
+        logger.info("generate.output tool=%s session=%s items=%s", tool, log_session_id(sid), len(items))
         return send_pdf(out, "we-love-pdf-organized.pdf")
 
     refs = selected_page_refs(data, workdir)
+
+    if tool == "excel":
+        out, download_name = create_excel_from_refs(workdir, refs)
+        logger.info("generate.output tool=%s session=%s pages=%s", tool, log_session_id(sid), len(refs))
+        return send_download(
+            out,
+            download_name,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
     result = document_from_refs(workdir, refs)
 
     if tool == "redact":
@@ -729,7 +1116,7 @@ def generate_from_preview(tool: str):
         "edit": "edited.pdf",
     }.get(tool, "output.pdf")
     out = save_generated_pdf(result, workdir, filename, maximum=options.get("level") == "maximum")
-    logger.info("generate.output tool=%s session=%s pages=%s", tool, sid, len(refs))
+    logger.info("generate.output tool=%s session=%s pages=%s", tool, log_session_id(sid), len(refs))
     return send_pdf(out, f"we-love-pdf-{filename}")
 
 
@@ -772,7 +1159,7 @@ def redact_pdf():
             if page.first_annot:
                 page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
         doc.save(out, garbage=4, deflate=True, clean=True)
-    logger.info("redact.output session=%s matches=%s", sid, redactions)
+    logger.info("redact.output session=%s matches=%s", log_session_id(sid), redactions)
     return send_pdf(out, "we-love-pdf-redacted.pdf")
 
 

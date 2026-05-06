@@ -35,6 +35,12 @@ const toolConfig = {
     hint: "Choose one PDF.",
     output: "we-love-pdf-edited.pdf",
   },
+  excel: {
+    title: "PDF to Excel",
+    description: "Upload a PDF, preview the pages, remove anything unnecessary, then generate an Excel workbook.",
+    hint: "Choose one PDF. Each selected page becomes one Excel sheet.",
+    output: "we-love-pdf-excel.xlsx",
+  },
 };
 
 const state = {
@@ -85,6 +91,15 @@ function setStatus(message, isError = false) {
   if (!statusBox) return;
   statusBox.textContent = message;
   statusBox.classList.toggle("error", isError);
+}
+
+function safeBrowserError(data, fallback) {
+  const message = typeof data?.error === "string" ? data.error.trim() : "";
+  if (!message) return fallback;
+  if (message.length > 160 || /traceback|exception|error:|\/tmp|\\|\/users\//i.test(message)) {
+    return fallback;
+  }
+  return message;
 }
 
 function filterTools(category) {
@@ -181,20 +196,35 @@ function clampPage(value, total) {
   return Math.min(Math.max(page, 1), Math.max(total, 1));
 }
 
+function createIconButton(className, label, text) {
+  const button = document.createElement("button");
+  button.className = className;
+  button.type = "button";
+  button.setAttribute("aria-label", label);
+  button.textContent = text;
+  return button;
+}
+
 function renderDocument(documentData, fileName) {
   if (state.activeTool === "merge") {
     const card = document.createElement("article");
     card.className = "merge-card";
     card.dataset.documentId = documentData.documentId;
-    card.innerHTML = `
-      <button class="organize-remove" type="button" aria-label="Remove file">x</button>
-      <div class="organize-sheet">
-        <img src="/api/document/${state.sessionId}/${documentData.documentId}/thumbnail/1" alt="${fileName} preview">
-      </div>
-      <strong class="merge-file-name">${fileName}</strong>
-      <span class="merge-page-count">${documentData.pages.length} ${documentData.pages.length === 1 ? "page" : "pages"}</span>
-    `;
-    card.querySelector(".organize-remove").addEventListener("click", () => {
+    const removeButton = createIconButton("organize-remove", "Remove file", "x");
+    const sheet = document.createElement("div");
+    sheet.className = "organize-sheet";
+    const img = document.createElement("img");
+    img.src = `/api/document/${state.sessionId}/${documentData.documentId}/thumbnail/1`;
+    img.alt = `${fileName} preview`;
+    sheet.append(img);
+    const name = document.createElement("strong");
+    name.className = "merge-file-name";
+    name.textContent = fileName;
+    const pageCount = document.createElement("span");
+    pageCount.className = "merge-page-count";
+    pageCount.textContent = `${documentData.pages.length} ${documentData.pages.length === 1 ? "page" : "pages"}`;
+    card.append(removeButton, sheet, name, pageCount);
+    removeButton.addEventListener("click", () => {
       card.remove();
       updatePreviewCount();
     });
@@ -228,19 +258,27 @@ function renderDocument(documentData, fileName) {
     return;
   }
 
+  if (state.activeTool === "excel") {
+    initializePageCardPreview(documentData, state.activeTool);
+    return;
+  }
+
   documentData.pages.forEach((page) => {
     const card = document.createElement("article");
     card.className = "thumb";
     card.dataset.documentId = documentData.documentId;
     card.dataset.page = page.page;
-    card.innerHTML = `
-      <img src="/api/document/${state.sessionId}/${documentData.documentId}/thumbnail/${page.page}" alt="${fileName} page ${page.page}">
-      <div class="thumb-footer">
-        <span>${fileName} - ${page.page}</span>
-        <button class="remove-page" type="button" aria-label="Remove page">x</button>
-      </div>
-    `;
-    card.querySelector(".remove-page").addEventListener("click", () => {
+    const img = document.createElement("img");
+    img.src = `/api/document/${state.sessionId}/${documentData.documentId}/thumbnail/${page.page}`;
+    img.alt = `${fileName} page ${page.page}`;
+    const footer = document.createElement("div");
+    footer.className = "thumb-footer";
+    const label = document.createElement("span");
+    label.textContent = `${fileName} - ${page.page}`;
+    const removeButton = createIconButton("remove-page", "Remove page", "x");
+    footer.append(label, removeButton);
+    card.append(img, footer);
+    removeButton.addEventListener("click", () => {
       card.remove();
       updatePreviewCount();
     });
@@ -265,7 +303,7 @@ async function uploadFiles(files) {
     const res = await fetch("/api/document", { method: "POST", body: formData });
     if (!res.ok) {
       const data = await res.json().catch(() => ({ error: "Upload failed" }));
-      setStatus(data.error || "Upload failed", true);
+      setStatus(safeBrowserError(data, "Upload failed. Please check the PDF and try again."), true);
       return;
     }
     const documentData = await res.json();
@@ -288,6 +326,8 @@ async function uploadFiles(files) {
       ? "Preview ready. Drag pages, rotate pages, remove pages, or add blank pages."
     : state.activeTool === "merge"
       ? "Preview ready. Drag files into the merge order, then generate."
+    : state.activeTool === "excel"
+      ? "Preview ready. Remove pages you do not need, then generate the Excel workbook."
     : "Preview ready. Drag pages into order, remove unwanted pages, then generate.";
   setStatus(message);
 }
@@ -301,7 +341,7 @@ function selectedPages() {
     const doc = firstDocument();
     return doc ? doc.pages.map((page) => ({ documentId: doc.documentId, page: page.page })) : [];
   }
-  return Array.from(previewGrid.querySelectorAll(".thumb, .split-card, .compress-card, .edit-card")).map((thumb) => ({
+  return Array.from(previewGrid.querySelectorAll(".thumb, .split-card, .compress-card, .edit-card, .excel-card")).map((thumb) => ({
     documentId: thumb.dataset.documentId,
     page: Number(thumb.dataset.page),
   }));
@@ -357,7 +397,11 @@ function renderUploadedFiles() {
   state.documents.forEach((doc, index) => {
     const row = document.createElement("div");
     row.className = "uploaded-file-row";
-    row.innerHTML = `<span>↕</span><strong>${String.fromCharCode(65 + index)}: ${doc.fileName || "Uploaded PDF"}</strong>`;
+    const dragHandle = document.createElement("span");
+    dragHandle.textContent = "↕";
+    const name = document.createElement("strong");
+    name.textContent = `${String.fromCharCode(65 + index)}: ${doc.fileName || "Uploaded PDF"}`;
+    row.append(dragHandle, name);
     list.append(row);
   });
 }
@@ -713,12 +757,20 @@ function renderMarkedList() {
   groups.forEach((items, page) => {
     const group = document.createElement("section");
     group.className = "marked-group";
-    group.innerHTML = `<h3>Page ${page}</h3>`;
+    const title = document.createElement("h3");
+    title.textContent = `Page ${page}`;
+    group.append(title);
     items.forEach(({ mark, index }) => {
       const row = document.createElement("div");
       row.className = "marked-item";
-      row.innerHTML = `<span class="text-icon">T</span><span>${mark.term}</span><button type="button" aria-label="Remove mark">x</button>`;
-      row.querySelector("button").addEventListener("click", () => {
+      const icon = document.createElement("span");
+      icon.className = "text-icon";
+      icon.textContent = "T";
+      const term = document.createElement("span");
+      term.textContent = mark.term;
+      const button = createIconButton("", "Remove mark", "x");
+      row.append(icon, term, button);
+      button.addEventListener("click", () => {
         state.redact.marks.splice(index, 1);
         renderMarkedList();
         renderRedactPage();
@@ -759,7 +811,7 @@ async function searchRedactText() {
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({ error: "Search failed" }));
-    setStatus(data.error || "Search failed", true);
+    setStatus(safeBrowserError(data, "Unable to search this PDF. Please try again."), true);
     return;
   }
   const data = await res.json();
@@ -1301,7 +1353,7 @@ async function generateOutput() {
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({ error: "Generation failed" }));
-      setStatus(data.error || "Generation failed", true);
+      setStatus(safeBrowserError(data, "Unable to generate the PDF. Please try again."), true);
       return;
     }
     const blob = await res.blob();
@@ -1337,7 +1389,7 @@ async function generateOutput() {
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({ error: "Split failed" }));
-      setStatus(data.error || "Split failed", true);
+      setStatus(safeBrowserError(data, "Unable to split the PDF. Please try again."), true);
       return;
     }
     const blob = await res.blob();
@@ -1367,7 +1419,7 @@ async function generateOutput() {
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({ error: "Redaction failed" }));
-      setStatus(data.error || "Redaction failed", true);
+      setStatus(safeBrowserError(data, "Unable to redact the PDF. Please try again."), true);
       return;
     }
     const blob = await res.blob();
@@ -1394,7 +1446,7 @@ async function generateOutput() {
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({ error: "Organize failed" }));
-      setStatus(data.error || "Organize failed", true);
+      setStatus(safeBrowserError(data, "Unable to organize the PDF. Please try again."), true);
       return;
     }
     const blob = await res.blob();
@@ -1419,7 +1471,7 @@ async function generateOutput() {
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({ error: "Generation failed" }));
-    setStatus(data.error || "Generation failed", true);
+    setStatus(safeBrowserError(data, "Unable to generate the PDF. Please try again."), true);
     return;
   }
   const blob = await res.blob();
@@ -1515,7 +1567,7 @@ function setupToolPage() {
   document.querySelector(".preview-workspace")?.classList.toggle("edit-workspace", state.activeTool === "edit");
   previewGrid?.classList.toggle("redact-grid", state.activeTool === "redact");
   previewGrid?.classList.toggle("edit-grid", state.activeTool === "edit");
-  previewGrid?.classList.toggle("organize-grid", state.activeTool === "organize" || state.activeTool === "merge" || state.activeTool === "split" || state.activeTool === "compress");
+  previewGrid?.classList.toggle("organize-grid", state.activeTool === "organize" || state.activeTool === "merge" || state.activeTool === "split" || state.activeTool === "compress" || state.activeTool === "excel");
   document.getElementById("uploadedFilesPanel").hidden = state.documents.length === 0;
   document.getElementById("toolTitle").textContent = config.title;
   document.getElementById("toolDescription").textContent = config.description;
@@ -1531,6 +1583,8 @@ function setupToolPage() {
         ? "Edit PDF"
       : state.activeTool === "organize"
         ? "Organize pages before generating"
+      : state.activeTool === "excel"
+        ? "Select pages for Excel conversion"
       : "Arrange pages before generating";
   document.getElementById("previewEmptyText").textContent = state.activeTool === "merge"
     ? "Then drag files into merge order, remove unwanted files, and click Generate."
@@ -1542,6 +1596,8 @@ function setupToolPage() {
         ? "Use the toolbar to choose what to add, then click the PDF page to place it with the cursor."
       : state.activeTool === "organize"
         ? "Then drag pages, remove pages, rotate pages, add blank pages, and click Generate."
+      : state.activeTool === "excel"
+        ? "Then remove pages you do not need and click Generate to download an Excel workbook."
       : "Then drag pages into order, remove unwanted pages, and click Generate.";
 
   document.querySelectorAll(".tool-options > *").forEach((option) => {
