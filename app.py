@@ -11,13 +11,16 @@ import zipfile
 from pathlib import Path
 
 import fitz
-from flask import Flask, abort, jsonify, render_template, request, send_file
+from flask import Flask, abort, g, jsonify, render_template, request, send_file
 from werkzeug.utils import secure_filename
 
 
 APP_NAME = "We Love PDF"
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "150"))
 SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_MINUTES", "60")) * 60
+MAX_PDF_PAGES = int(os.environ.get("MAX_PDF_PAGES", "300"))
+MAX_OCR_PAGES = int(os.environ.get("MAX_OCR_PAGES", "25"))
+MAX_OPERATION_SECONDS = int(os.environ.get("MAX_OPERATION_SECONDS", "120"))
 TEMP_ROOT = Path(os.environ.get("APP_TEMP_ROOT", tempfile.gettempdir())) / "we-love-pdf"
 ALLOWED_EXTENSIONS = {".pdf"}
 TOOLS = {"merge", "split", "compress", "organize", "redact", "edit"}
@@ -40,12 +43,14 @@ def clean_expired_sessions() -> None:
     ensure_temp_root()
     now = time.time()
     for path in TEMP_ROOT.iterdir():
+        check_operation_budget()
         if path.is_dir() and now - path.stat().st_mtime > SESSION_TTL_SECONDS:
             shutil.rmtree(path, ignore_errors=True)
 
 
 @app.before_request
 def before_request() -> None:
+    g.operation_started_at = time.monotonic()
     clean_expired_sessions()
 
 
@@ -89,18 +94,31 @@ def require_pdf(file_storage) -> None:
         abort(400, "Only PDF files are allowed")
 
 
+def check_operation_budget() -> None:
+    started_at = getattr(g, "operation_started_at", None)
+    if started_at is not None and time.monotonic() - started_at > MAX_OPERATION_SECONDS:
+        abort(408, "PDF operation exceeded the configured time limit")
+
+
+def validate_pdf_page_limit(page_count: int) -> None:
+    if page_count > MAX_PDF_PAGES:
+        abort(400, f"PDF has {page_count} pages; maximum allowed is {MAX_PDF_PAGES}")
+
+
 def save_pdf_upload(file_storage, target_dir: Path, prefix: str = "upload") -> Path:
     require_pdf(file_storage)
     filename = secure_filename(file_storage.filename or "document.pdf")
     path = target_dir / f"{prefix}-{uuid.uuid4().hex}-{filename}"
     file_storage.save(path)
     try:
-        with fitz.open(path) as doc:
-            if doc.page_count < 1:
-                abort(400, "Uploaded PDF has no pages")
-    except Exception as exc:
+        doc = fitz.open(path)
+    except Exception:
         path.unlink(missing_ok=True)
-        abort(400, f"Invalid PDF: {exc}")
+        abort(400, "Invalid PDF file")
+    with doc:
+        if doc.page_count < 1:
+            abort(400, "Uploaded PDF has no pages")
+        validate_pdf_page_limit(doc.page_count)
     return path
 
 
@@ -192,6 +210,7 @@ def merge_pdfs():
         abort(400, "Upload at least two PDFs")
     result = fitz.open()
     for index, upload in enumerate(uploads):
+        check_operation_budget()
         path = save_pdf_upload(upload, workdir, "merge")
         with fitz.open(path) as doc:
             page_count = doc.page_count
@@ -221,8 +240,10 @@ def split_pdf():
         else:
             page_sets = [parse_pages(ranges, doc.page_count)]
         for set_index, pages in enumerate(page_sets, start=1):
+            check_operation_budget()
             split_doc = fitz.open()
             for page in pages:
+                check_operation_budget()
                 split_doc.insert_pdf(doc, from_page=page, to_page=page)
             out = output_path(workdir, f"split-{set_index}.pdf")
             split_doc.save(out, garbage=4, deflate=True, clean=True)
@@ -283,10 +304,12 @@ def selected_page_refs(data: dict, workdir: Path) -> list[dict]:
         abort(400, "Upload and keep at least one page in the preview")
     selected = []
     for ref in refs:
+        check_operation_budget()
         document_id = str(ref.get("documentId", ""))
         page_number = int(ref.get("page", 0))
         path = find_document(workdir, document_id)
         with fitz.open(path) as doc:
+            validate_pdf_page_limit(doc.page_count)
             if page_number < 1 or page_number > doc.page_count:
                 abort(400, "Invalid page in preview")
         selected.append({"documentId": document_id, "page": page_number})
@@ -299,6 +322,7 @@ def selected_document_refs(data: dict, workdir: Path) -> list[str]:
         abort(400, "Upload and keep at least two PDFs in the preview")
     selected = []
     for document_id in refs:
+        check_operation_budget()
         safe_id = str(document_id)
         find_document(workdir, safe_id)
         selected.append(safe_id)
@@ -308,8 +332,10 @@ def selected_document_refs(data: dict, workdir: Path) -> list[str]:
 def document_from_document_refs(workdir: Path, refs: list[str]) -> fitz.Document:
     result = fitz.open()
     for document_id in refs:
+        check_operation_budget()
         path = find_document(workdir, document_id)
         with fitz.open(path) as source:
+            validate_pdf_page_limit(source.page_count)
             result.insert_pdf(source)
     return result
 
@@ -317,6 +343,7 @@ def document_from_document_refs(workdir: Path, refs: list[str]) -> fitz.Document
 def document_from_refs(workdir: Path, refs: list[dict]) -> fitz.Document:
     result = fitz.open()
     for ref in refs:
+        check_operation_budget()
         path = find_document(workdir, ref["documentId"])
         page_index = int(ref["page"]) - 1
         with fitz.open(path) as source:
@@ -331,6 +358,7 @@ def organized_document_from_items(workdir: Path, items: list[dict]) -> fitz.Docu
     default_width = 595
     default_height = 842
     for item in items:
+        check_operation_budget()
         item_type = str(item.get("type") or "page")
         rotation = int(item.get("rotation") or 0) % 360
         if item_type == "blank":
@@ -345,6 +373,7 @@ def organized_document_from_items(workdir: Path, items: list[dict]) -> fitz.Docu
         page_number = int(item.get("page") or 0)
         path = find_document(workdir, document_id)
         with fitz.open(path) as source:
+            validate_pdf_page_limit(source.page_count)
             if page_number < 1 or page_number > source.page_count:
                 abort(400, "Invalid page in organizer")
             result.insert_pdf(source, from_page=page_number - 1, to_page=page_number - 1)
@@ -360,6 +389,7 @@ def document_from_range(workdir: Path, document_id: str, start: int, end: int) -
     path = find_document(workdir, document_id)
     result = fitz.open()
     with fitz.open(path) as source:
+        validate_pdf_page_limit(source.page_count)
         if start < 1 or end < 1 or start > source.page_count or end > source.page_count:
             abort(400, "Split range is outside the document")
         if start > end:
@@ -371,12 +401,20 @@ def document_from_range(workdir: Path, document_id: str, start: int, end: int) -
 def search_document_text(path: Path, term: str, use_ocr: bool = False) -> tuple[list[dict], str]:
     matches: list[dict] = []
     ocr_warning = ""
+    ocr_page_count = 0
     with fitz.open(path) as doc:
+        validate_pdf_page_limit(doc.page_count)
         for page_index, page in enumerate(doc):
+            check_operation_budget()
             rects = page.search_for(term)
             used_ocr = False
             if not rects and use_ocr and hasattr(page, "get_textpage_ocr"):
+                ocr_page_count += 1
+                if ocr_page_count > MAX_OCR_PAGES:
+                    ocr_warning = f"OCR limited to {MAX_OCR_PAGES} pages. Narrow the document or search without OCR."
+                    break
                 try:
+                    check_operation_budget()
                     textpage = page.get_textpage_ocr(language="eng", full=True)
                     rects = page.search_for(term, textpage=textpage)
                     used_ocr = bool(rects)
@@ -408,6 +446,7 @@ def save_generated_pdf(doc: fitz.Document, workdir: Path, filename: str, maximum
     save_kwargs = {"garbage": 4, "deflate": True, "clean": True}
     if maximum:
         save_kwargs.update({"deflate_images": True, "deflate_fonts": True})
+    check_operation_budget()
     doc.save(out, **save_kwargs)
     doc.close()
     return out
@@ -475,9 +514,11 @@ def thumbnail(session_id: str, document_id: str, page_number: int):
     workdir = session_dir(session_id)
     path = find_document(workdir, document_id)
     with fitz.open(path) as doc:
+        validate_pdf_page_limit(doc.page_count)
         if page_number < 1 or page_number > doc.page_count:
             abort(404)
         page = doc[page_number - 1]
+        check_operation_budget()
         pix = page.get_pixmap(matrix=fitz.Matrix(0.24, 0.24), alpha=False)
         return send_file(io.BytesIO(pix.tobytes("png")), mimetype="image/png", max_age=0)
 
@@ -487,9 +528,11 @@ def preview(session_id: str, document_id: str, page_number: int):
     workdir = session_dir(session_id)
     path = find_document(workdir, document_id)
     with fitz.open(path) as doc:
+        validate_pdf_page_limit(doc.page_count)
         if page_number < 1 or page_number > doc.page_count:
             abort(404)
         page = doc[page_number - 1]
+        check_operation_budget()
         pix = page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False)
         return send_file(io.BytesIO(pix.tobytes("png")), mimetype="image/png", max_age=0)
 
@@ -556,6 +599,7 @@ def generate_from_preview(tool: str):
             if options.get("mergeRanges"):
                 merged = fitz.open()
                 for item in ranges:
+                    check_operation_budget()
                     part = document_from_range(workdir, document_id, int(item.get("from", 1)), int(item.get("to", 1)))
                     merged.insert_pdf(part)
                     part.close()
@@ -564,6 +608,7 @@ def generate_from_preview(tool: str):
 
             outputs: list[tuple[str, Path]] = []
             for index, item in enumerate(ranges, start=1):
+                check_operation_budget()
                 split_doc = document_from_range(workdir, document_id, int(item.get("from", 1)), int(item.get("to", 1)))
                 out = save_generated_pdf(split_doc, workdir, f"split-range-{index}.pdf")
                 outputs.append((f"split-range-{index}.pdf", out))
@@ -575,6 +620,7 @@ def generate_from_preview(tool: str):
         refs = selected_page_refs(data, workdir)
         outputs: list[tuple[str, Path]] = []
         for index, ref in enumerate(refs, start=1):
+            check_operation_budget()
             split_doc = document_from_refs(workdir, [ref])
             out = save_generated_pdf(split_doc, workdir, f"split-page-{index}.pdf")
             outputs.append((f"split-page-{index}.pdf", out))
@@ -599,6 +645,7 @@ def generate_from_preview(tool: str):
         rect_redactions = options.get("rects", [])
         if isinstance(rect_redactions, list):
             for item in rect_redactions:
+                check_operation_budget()
                 page_index = int(item.get("page") or 1) - 1
                 if page_index < 0 or page_index >= result.page_count:
                     abort(400, "Redaction page is outside the preview range")
@@ -614,6 +661,7 @@ def generate_from_preview(tool: str):
                 )
         terms = [term.strip() for term in str(options.get("terms", "")).splitlines() if term.strip()]
         for page in result:
+            check_operation_budget()
             for term in terms:
                 for rect in page.search_for(term):
                     page.add_redact_annot(rect, fill=(0, 0, 0))
@@ -630,6 +678,7 @@ def generate_from_preview(tool: str):
                 abort(400, "Area width and height are required")
             result[page_index].add_redact_annot(fitz.Rect(x, y, x + width, y + height), fill=(0, 0, 0))
         for page in result:
+            check_operation_budget()
             if page.first_annot:
                 page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
 
@@ -637,6 +686,7 @@ def generate_from_preview(tool: str):
         edits = options.get("edits", [])
         if isinstance(edits, list) and edits:
             for edit in edits:
+                check_operation_budget()
                 page_index = int(edit.get("page") or 1) - 1
                 if page_index < 0 or page_index >= result.page_count:
                     abort(400, "Edit page is outside the preview range")
@@ -699,6 +749,7 @@ def redact_pdf():
     with fitz.open(path) as doc:
         target_pages = parse_pages(page_text, doc.page_count) if page_text.strip() else list(range(doc.page_count))
         for page_index in target_pages:
+            check_operation_budget()
             page = doc[page_index]
             for term in search_terms:
                 for rect in page.search_for(term):
@@ -717,6 +768,7 @@ def redact_pdf():
             doc[page_index].add_redact_annot(fitz.Rect(x, y, x + width, y + height), fill=(0, 0, 0))
             redactions += 1
         for page in doc:
+            check_operation_budget()
             if page.first_annot:
                 page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
         doc.save(out, garbage=4, deflate=True, clean=True)
@@ -752,6 +804,7 @@ def edit_pdf():
 
 @app.errorhandler(400)
 @app.errorhandler(404)
+@app.errorhandler(408)
 @app.errorhandler(413)
 @app.errorhandler(500)
 def handle_error(error):

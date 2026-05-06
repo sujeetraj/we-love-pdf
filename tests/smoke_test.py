@@ -21,6 +21,9 @@ def sample_pdf(text: str, pages: int = 1) -> bytes:
 class SmokeTest(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
+        self.original_max_pdf_pages = pdf_app.MAX_PDF_PAGES
+        self.original_max_ocr_pages = pdf_app.MAX_OCR_PAGES
+        self.original_max_operation_seconds = pdf_app.MAX_OPERATION_SECONDS
         pdf_app.TEMP_ROOT = Path(self.tempdir.name)
         pdf_app.app.config["TESTING"] = True
         self.client = pdf_app.app.test_client()
@@ -28,6 +31,9 @@ class SmokeTest(unittest.TestCase):
         self.session_id = response.get_json()["sessionId"]
 
     def tearDown(self):
+        pdf_app.MAX_PDF_PAGES = self.original_max_pdf_pages
+        pdf_app.MAX_OCR_PAGES = self.original_max_ocr_pages
+        pdf_app.MAX_OPERATION_SECONDS = self.original_max_operation_seconds
         self.tempdir.cleanup()
 
     def post_pdf(self, endpoint: str, fields: dict, filename: str = "sample.pdf"):
@@ -213,6 +219,27 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(redacted.status_code, 200)
         with fitz.open(stream=redacted.data, filetype="pdf") as doc:
             self.assertNotIn("NAME", doc[0].get_text())
+
+    def test_invalid_pdf_error_is_generic(self):
+        response = self.client.post(
+            "/api/document",
+            data={"sessionId": self.session_id, "file": (io.BytesIO(b"not a pdf"), "bad.pdf")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 400)
+        error = response.get_json()["error"]
+        self.assertEqual(error, "Invalid PDF file")
+        self.assertNotIn(str(self.tempdir.name), error)
+
+    def test_pdf_page_limit_is_enforced(self):
+        pdf_app.MAX_PDF_PAGES = 2
+        response = self.client.post(
+            "/api/document",
+            data={"sessionId": self.session_id, "file": (io.BytesIO(sample_pdf("many", pages=3)), "many.pdf")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("maximum allowed is 2", response.get_json()["error"])
 
 
 if __name__ == "__main__":

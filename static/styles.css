@@ -1384,6 +1384,56 @@ textarea {
   color: var(--red-dark);
 }
 
+.completion-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(23, 23, 23, 0.34);
+}
+
+.completion-panel {
+  width: min(520px, 100%);
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  padding: 34px;
+  border-radius: 8px;
+  background: #fff;
+  text-align: center;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.24);
+}
+
+.completion-icon {
+  display: grid;
+  place-items: center;
+  width: 62px;
+  height: 62px;
+  border-radius: 50%;
+  background: #e7f7ed;
+  color: #178a45;
+  font-size: 34px;
+  font-weight: 900;
+}
+
+.completion-panel h2 {
+  margin: 0;
+  font-size: 32px;
+}
+
+.completion-panel p:not(.eyebrow) {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 17px;
+  line-height: 1.45;
+}
+
+.completion-panel .primary {
+  min-width: 190px;
+}
+
 .page-count {
   padding: 8px 12px;
   border: 1px solid var(--line);

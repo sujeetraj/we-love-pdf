@@ -111,6 +111,28 @@ function downloadBlob(blob, filename) {
   URL.revokeObjectURL(url);
 }
 
+function showCompletionPanel(filename) {
+  const modal = document.getElementById("completionModal");
+  const message = document.getElementById("completionMessage");
+  if (!modal || !message) return;
+  message.textContent = `Check your downloads folder for ${filename}.`;
+  modal.hidden = false;
+  document.getElementById("anotherTaskBtn")?.focus();
+}
+
+function handleCompletedDownload(res, blob) {
+  const filename = filenameFromResponse(res, toolConfig[state.activeTool].output);
+  downloadBlob(blob, filename);
+  setStatus("");
+  showCompletionPanel(filename);
+}
+
+function startAnotherTask() {
+  document.getElementById("completionModal").hidden = true;
+  clearPreview(true);
+  window.location.href = "/";
+}
+
 function updatePreviewCount() {
   if (!previewGrid || !pageCount || !previewEmpty) return;
   if (state.activeTool === "redact") {
@@ -1283,8 +1305,7 @@ async function generateOutput() {
       return;
     }
     const blob = await res.blob();
-    downloadBlob(blob, filenameFromResponse(res, toolConfig[state.activeTool].output));
-    setStatus("Done. Output downloaded.");
+    handleCompletedDownload(res, blob);
     return;
   }
 
@@ -1320,8 +1341,7 @@ async function generateOutput() {
       return;
     }
     const blob = await res.blob();
-    downloadBlob(blob, filenameFromResponse(res, toolConfig[state.activeTool].output));
-    setStatus("Done. Split output downloaded.");
+    handleCompletedDownload(res, blob);
     return;
   }
 
@@ -1351,8 +1371,7 @@ async function generateOutput() {
       return;
     }
     const blob = await res.blob();
-    downloadBlob(blob, filenameFromResponse(res, toolConfig[state.activeTool].output));
-    setStatus("Done. Redacted PDF downloaded.");
+    handleCompletedDownload(res, blob);
     return;
   }
 
@@ -1379,8 +1398,7 @@ async function generateOutput() {
       return;
     }
     const blob = await res.blob();
-    downloadBlob(blob, filenameFromResponse(res, toolConfig[state.activeTool].output));
-    setStatus("Done. Organized PDF downloaded.");
+    handleCompletedDownload(res, blob);
     return;
   }
 
@@ -1405,8 +1423,7 @@ async function generateOutput() {
     return;
   }
   const blob = await res.blob();
-  downloadBlob(blob, filenameFromResponse(res, toolConfig[state.activeTool].output));
-  setStatus("Done. Output downloaded.");
+  handleCompletedDownload(res, blob);
 }
 
 function clearPreview(resetInput = true) {
@@ -1542,6 +1559,7 @@ function setupToolPage() {
   bindDropzone();
   document.getElementById("generateBtn").addEventListener("click", generateOutput);
   document.getElementById("clearPreviewBtn").addEventListener("click", () => clearPreview(true));
+  document.getElementById("anotherTaskBtn")?.addEventListener("click", startAnotherTask);
 
   if (window.Sortable) {
     Sortable.create(previewGrid, {

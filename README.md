@@ -91,12 +91,20 @@ docker run --rm -p 8000:8000 -e MAX_UPLOAD_MB=150 we-love-pdf
 
 The container runs Gunicorn and includes Tesseract OCR English language data for scanned PDF redaction search.
 
+For the hardened local container profile with CPU, memory, PID, read-only filesystem, and tmpfs limits:
+
+```bash
+docker compose up --build
+```
+
+The compose profile confines writable data to `/tmp`, drops Linux capabilities, prevents privilege escalation, and applies resource limits so expensive PDF parsing/OCR work is contained within the application container.
+
 ## Internal Network Deployment
 
 For a direct server deployment:
 
 ```bash
-gunicorn -w 2 -b 0.0.0.0:8000 app:app
+gunicorn -w 2 -b 0.0.0.0:8000 --timeout 150 --graceful-timeout 20 --max-requests 100 --max-requests-jitter 20 app:app
 ```
 
 Recommended production placement:
@@ -115,6 +123,12 @@ Recommended production placement:
 | `MAX_UPLOAD_MB` | `150` | Maximum request upload size in MB |
 | `APP_TEMP_ROOT` | OS temp directory + `we-love-pdf` | Root directory for temporary session folders |
 | `SESSION_TTL_MINUTES` | `60` | Time before temporary sessions are eligible for cleanup |
+| `MAX_PDF_PAGES` | `300` | Maximum pages allowed in an uploaded PDF |
+| `MAX_OCR_PAGES` | `25` | Maximum pages OCR may process during one redaction search |
+| `MAX_OPERATION_SECONDS` | `120` | Cooperative time budget for heavy PDF operations |
+| `GUNICORN_WORKERS` | `2` | Container Gunicorn worker count |
+| `GUNICORN_TIMEOUT` | `150` | Gunicorn worker timeout in seconds |
+| `GUNICORN_GRACEFUL_TIMEOUT` | `20` | Gunicorn graceful shutdown timeout in seconds |
 | `TESSDATA_PREFIX` | System default | Tesseract language data path for OCR |
 | `PORT` | `8000` | Port used by the Flask development server |
 
@@ -134,6 +148,9 @@ The application does not use a database and does not intentionally retain upload
 - PDF files are processed server-side with PyMuPDF.
 - Security headers are applied by the Flask app, including content type, frame, referrer, permissions, cache, and CSP controls.
 - Uploaded files are validated as PDFs before processing.
+- Uploaded PDFs are rejected when they exceed the configured page limit.
+- OCR searches are capped by page count, and heavy operations have a configurable time budget.
+- Container deployment can be run with CPU, memory, PID, read-only filesystem, dropped capability, and `no-new-privileges` limits through `docker-compose.yml`.
 - Runtime scripts and vendor assets are served locally.
 - OCR is opt-in for redaction searches.
 
@@ -143,6 +160,7 @@ The application does not use a database and does not intentionally retain upload
 .
 ├── app.py
 ├── Dockerfile
+├── docker-compose.yml
 ├── requirements.txt
 ├── static/
 │   ├── app.js

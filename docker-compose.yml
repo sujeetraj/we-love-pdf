@@ -1,0 +1,27 @@
+services:
+  we-love-pdf:
+    build: .
+    image: we-love-pdf:latest
+    ports:
+      - "8000:8000"
+    environment:
+      MAX_UPLOAD_MB: "150"
+      SESSION_TTL_MINUTES: "60"
+      MAX_PDF_PAGES: "300"
+      MAX_OCR_PAGES: "25"
+      MAX_OPERATION_SECONDS: "120"
+      GUNICORN_WORKERS: "2"
+      GUNICORN_TIMEOUT: "150"
+      GUNICORN_GRACEFUL_TIMEOUT: "20"
+      APP_TEMP_ROOT: /tmp/we-love-pdf
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=512m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 768m
+    cpus: 1.5
+    restart: unless-stopped
