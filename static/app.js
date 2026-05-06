@@ -41,6 +41,18 @@ const toolConfig = {
     hint: "Choose one PDF. Each selected page becomes one Excel sheet.",
     output: "we-love-pdf-excel.xlsx",
   },
+  word: {
+    title: "PDF to Word",
+    description: "Upload a PDF, preview the pages, remove anything unnecessary, then generate a Word document.",
+    hint: "Choose one PDF. Selected pages are converted into an editable Word document.",
+    output: "we-love-pdf-word.docx",
+  },
+  ppt: {
+    title: "PDF to PPT",
+    description: "Upload a PDF, preview the pages, remove anything unnecessary, then generate a PowerPoint deck.",
+    hint: "Choose one PDF. Each selected page becomes one slide.",
+    output: "we-love-pdf-ppt.pptx",
+  },
 };
 
 const state = {
@@ -263,6 +275,11 @@ function renderDocument(documentData, fileName) {
     return;
   }
 
+  if (state.activeTool === "word" || state.activeTool === "ppt") {
+    initializePageCardPreview(documentData, state.activeTool);
+    return;
+  }
+
   documentData.pages.forEach((page) => {
     const card = document.createElement("article");
     card.className = "thumb";
@@ -328,6 +345,10 @@ async function uploadFiles(files) {
       ? "Preview ready. Drag files into the merge order, then generate."
     : state.activeTool === "excel"
       ? "Preview ready. Remove pages you do not need, then generate the Excel workbook."
+    : state.activeTool === "word"
+      ? "Preview ready. Remove pages you do not need, then generate the Word document."
+    : state.activeTool === "ppt"
+      ? "Preview ready. Remove pages you do not need, then generate the PowerPoint deck."
     : "Preview ready. Drag pages into order, remove unwanted pages, then generate.";
   setStatus(message);
 }
@@ -341,7 +362,7 @@ function selectedPages() {
     const doc = firstDocument();
     return doc ? doc.pages.map((page) => ({ documentId: doc.documentId, page: page.page })) : [];
   }
-  return Array.from(previewGrid.querySelectorAll(".thumb, .split-card, .compress-card, .edit-card, .excel-card")).map((thumb) => ({
+  return Array.from(previewGrid.querySelectorAll(".thumb, .split-card, .compress-card, .edit-card, .excel-card, .word-card, .ppt-card")).map((thumb) => ({
     documentId: thumb.dataset.documentId,
     page: Number(thumb.dataset.page),
   }));
@@ -1567,7 +1588,7 @@ function setupToolPage() {
   document.querySelector(".preview-workspace")?.classList.toggle("edit-workspace", state.activeTool === "edit");
   previewGrid?.classList.toggle("redact-grid", state.activeTool === "redact");
   previewGrid?.classList.toggle("edit-grid", state.activeTool === "edit");
-  previewGrid?.classList.toggle("organize-grid", state.activeTool === "organize" || state.activeTool === "merge" || state.activeTool === "split" || state.activeTool === "compress" || state.activeTool === "excel");
+  previewGrid?.classList.toggle("organize-grid", state.activeTool === "organize" || state.activeTool === "merge" || state.activeTool === "split" || state.activeTool === "compress" || state.activeTool === "excel" || state.activeTool === "word" || state.activeTool === "ppt");
   document.getElementById("uploadedFilesPanel").hidden = state.documents.length === 0;
   document.getElementById("toolTitle").textContent = config.title;
   document.getElementById("toolDescription").textContent = config.description;
@@ -1585,6 +1606,10 @@ function setupToolPage() {
         ? "Organize pages before generating"
       : state.activeTool === "excel"
         ? "Select pages for Excel conversion"
+      : state.activeTool === "word"
+        ? "Select pages for Word conversion"
+      : state.activeTool === "ppt"
+        ? "Select pages for PowerPoint conversion"
       : "Arrange pages before generating";
   document.getElementById("previewEmptyText").textContent = state.activeTool === "merge"
     ? "Then drag files into merge order, remove unwanted files, and click Generate."
@@ -1598,6 +1623,10 @@ function setupToolPage() {
         ? "Then drag pages, remove pages, rotate pages, add blank pages, and click Generate."
       : state.activeTool === "excel"
         ? "Then remove pages you do not need and click Generate to download an Excel workbook."
+      : state.activeTool === "word"
+        ? "Then remove pages you do not need and click Generate to download a Word document."
+      : state.activeTool === "ppt"
+        ? "Then remove pages you do not need and click Generate to download a PowerPoint deck."
       : "Then drag pages into order, remove unwanted pages, and click Generate.";
 
   document.querySelectorAll(".tool-options > *").forEach((option) => {

@@ -271,6 +271,43 @@ class SmokeTest(unittest.TestCase):
         self.assertIn("xl/drawings/drawing1.xml", names)
         self.assertIn("xl/media/image1.png", names)
 
+    def test_generate_word_and_ppt_from_preview(self):
+        upload = self.client.post(
+            "/api/document",
+            data={"sessionId": self.session_id, "file": (io.BytesIO(table_pdf_with_image()), "report.pdf")},
+            content_type="multipart/form-data",
+        )
+        document_id = upload.get_json()["documentId"]
+        payload = {
+            "sessionId": self.session_id,
+            "pages": [{"documentId": document_id, "page": 1}],
+            "options": {},
+        }
+
+        word = self.client.post("/api/generate/word", json=payload)
+        self.assertEqual(word.status_code, 200)
+        self.assertEqual(word.mimetype, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        self.assertIn("converted-report.docx", word.headers["Content-Disposition"])
+        with zipfile.ZipFile(io.BytesIO(word.data)) as document:
+            document_xml = document.read("word/document.xml").decode("utf-8")
+            names = document.namelist()
+        self.assertIn("<w:b/>", document_xml)
+        self.assertIn("Name", document_xml)
+        self.assertIn("Alice", document_xml)
+        self.assertIn("word/media/image1.png", names)
+
+        ppt = self.client.post("/api/generate/ppt", json=payload)
+        self.assertEqual(ppt.status_code, 200)
+        self.assertEqual(ppt.mimetype, "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+        self.assertIn("converted-report.pptx", ppt.headers["Content-Disposition"])
+        with zipfile.ZipFile(io.BytesIO(ppt.data)) as deck:
+            slide_xml = deck.read("ppt/slides/slide1.xml").decode("utf-8")
+            names = deck.namelist()
+        self.assertIn('b="1"', slide_xml)
+        self.assertIn("Name", slide_xml)
+        self.assertIn("Alice", slide_xml)
+        self.assertIn("ppt/media/image1.png", names)
+
     def test_invalid_pdf_error_is_generic(self):
         response = self.client.post(
             "/api/document",

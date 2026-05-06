@@ -274,6 +274,43 @@ textarea {
   box-shadow: 0 -7px #fff, 0 7px #fff;
 }
 
+.word::before,
+.ppt::before {
+  width: 28px;
+  height: 32px;
+  left: 10px;
+  top: 8px;
+  border-radius: 3px;
+}
+
+.word::after {
+  content: "W";
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 32px;
+  left: 10px;
+  top: 8px;
+  background: transparent;
+  color: #fff;
+  font-size: 18px;
+  font-weight: 900;
+}
+
+.ppt::after {
+  content: "P";
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 32px;
+  left: 10px;
+  top: 8px;
+  background: transparent;
+  color: #fff;
+  font-size: 18px;
+  font-weight: 900;
+}
+
 .tool-view {
   padding: 24px;
 }

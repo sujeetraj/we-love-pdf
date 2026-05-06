@@ -25,7 +25,7 @@ MAX_OCR_PAGES = int(os.environ.get("MAX_OCR_PAGES", "25"))
 MAX_OPERATION_SECONDS = int(os.environ.get("MAX_OPERATION_SECONDS", "120"))
 TEMP_ROOT = Path(os.environ.get("APP_TEMP_ROOT", tempfile.gettempdir())) / "we-love-pdf"
 ALLOWED_EXTENSIONS = {".pdf"}
-TOOLS = {"merge", "split", "compress", "organize", "redact", "edit", "excel"}
+TOOLS = {"merge", "split", "compress", "organize", "redact", "edit", "excel", "word", "ppt"}
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
@@ -761,6 +761,342 @@ def create_excel_from_refs(workdir: Path, refs: list[dict]) -> tuple[Path, str]:
     return out, f"converted-{original_stem}.xlsx"
 
 
+def selected_page_packages(workdir: Path, refs: list[dict]) -> tuple[str, list[dict]]:
+    first_path = find_document(workdir, str(refs[0].get("documentId", "")))
+    original_stem = original_upload_stem(first_path)
+    pages = []
+    for index, ref in enumerate(refs, start=1):
+        check_operation_budget()
+        document_id = str(ref.get("documentId", ""))
+        page_number = int(ref.get("page", 0))
+        path = find_document(workdir, document_id)
+        with fitz.open(path) as doc:
+            validate_pdf_page_limit(doc.page_count)
+            if page_number < 1 or page_number > doc.page_count:
+                abort(400, "Invalid page in preview")
+            page = doc[page_number - 1]
+            cells, columns = worksheet_cells_from_page(page)
+            pages.append(
+                {
+                    "name": f"Page {index}",
+                    "width": float(page.rect.width),
+                    "height": float(page.rect.height),
+                    "cells": cells,
+                    "column_count": max(len(columns), 1),
+                    "images": extract_page_images(doc, page),
+                }
+            )
+    return original_stem, pages
+
+
+def word_run_xml(text: str, style: int) -> str:
+    props = ""
+    if style in {1, 3}:
+        props += "<w:b/>"
+    if style in {2, 3}:
+        props += "<w:i/>"
+    if props:
+        props = f"<w:rPr>{props}</w:rPr>"
+    return f'<w:r>{props}<w:t xml:space="preserve">{escape(text)}</w:t></w:r>'
+
+
+def word_image_xml(rel_id: str, rect: fitz.Rect) -> str:
+    width = max(int(rect.width * 12700), 1)
+    height = max(int(rect.height * 12700), 1)
+    return (
+        "<w:p><w:r><w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\" "
+        "xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\">"
+        f'<wp:extent cx="{width}" cy="{height}"/>'
+        '<wp:docPr id="1" name="PDF image"/>'
+        '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+        '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+        '<pic:nvPicPr><pic:cNvPr id="0" name="PDF image"/><pic:cNvPicPr/></pic:nvPicPr>'
+        f'<pic:blipFill><a:blip r:embed="{rel_id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>'
+        '<pic:spPr><a:xfrm><a:off x="0" y="0"/>'
+        f'<a:ext cx="{width}" cy="{height}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>'
+        "</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"
+    )
+
+
+def word_table_xml(rows: list[list[dict]]) -> str:
+    table_rows = []
+    for row in rows:
+        cells = []
+        sorted_cells = sorted(row, key=lambda item: int(item["col"]))
+        for cell in sorted_cells:
+            cells.append(f'<w:tc><w:p>{word_run_xml(str(cell["text"]), int(cell.get("style", 0)))}</w:p></w:tc>')
+        table_rows.append(f'<w:tr>{"".join(cells)}</w:tr>')
+    return (
+        '<w:tbl><w:tblPr><w:tblBorders>'
+        '<w:top w:val="single" w:sz="4" w:space="0" w:color="D9D9D9"/>'
+        '<w:left w:val="single" w:sz="4" w:space="0" w:color="D9D9D9"/>'
+        '<w:bottom w:val="single" w:sz="4" w:space="0" w:color="D9D9D9"/>'
+        '<w:right w:val="single" w:sz="4" w:space="0" w:color="D9D9D9"/>'
+        '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="D9D9D9"/>'
+        '<w:insideV w:val="single" w:sz="4" w:space="0" w:color="D9D9D9"/>'
+        f'</w:tblBorders></w:tblPr>{"".join(table_rows)}</w:tbl>'
+    )
+
+
+def create_word_from_refs(workdir: Path, refs: list[dict]) -> tuple[Path, str]:
+    original_stem, pages = selected_page_packages(workdir, refs)
+    out = output_path(workdir, f"converted-{original_stem}.docx")
+    body_parts = []
+    rels = []
+    media_index = 1
+    for page_index, page in enumerate(pages, start=1):
+        if page_index > 1:
+            body_parts.append('<w:p><w:r><w:br w:type="page"/></w:r></w:p>')
+        body_parts.append(f'<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>{escape(page["name"])}</w:t></w:r></w:p>')
+        body_parts.append(word_table_xml(page["cells"]))
+        for image in page["images"]:
+            rel_id = f"rIdImage{media_index}"
+            body_parts.append(word_image_xml(rel_id, image["rect"]))
+            rels.append(
+                f'<Relationship Id="{rel_id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image{media_index}.{image["extension"]}"/>'
+            )
+            media_index += 1
+
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'<w:body>{"".join(body_parts)}<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720"/></w:sectPr></w:body>'
+        "</w:document>"
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Default Extension="png" ContentType="image/png"/>'
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        "</Types>"
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+        "</Relationships>"
+    )
+    document_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'{"".join(rels)}</Relationships>'
+    )
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("word/document.xml", document_xml)
+        archive.writestr("word/_rels/document.xml.rels", document_rels)
+        media_index = 1
+        for page in pages:
+            for image in page["images"]:
+                archive.writestr(f"word/media/image{media_index}.{image['extension']}", image["bytes"])
+                media_index += 1
+    return out, f"converted-{original_stem}.docx"
+
+
+def ppt_text_body_xml(text: str, style: int) -> str:
+    attrs = ""
+    if style in {1, 3}:
+        attrs += ' b="1"'
+    if style in {2, 3}:
+        attrs += ' i="1"'
+    return (
+        "<p:txBody><a:bodyPr/><a:lstStyle/><a:p>"
+        f'<a:r><a:rPr lang="en-US" sz="1400"{attrs}/><a:t>{escape(text)}</a:t></a:r>'
+        "</a:p></p:txBody>"
+    )
+
+
+def ppt_text_shape_xml(shape_id: int, cell: dict, row_index: int, page: dict) -> str:
+    col = int(cell["col"]) - 1
+    x = int((col * 140 + 28) * 12700)
+    y = int((row_index * 24 + 36) * 12700)
+    width = int(130 * 12700)
+    height = int(22 * 12700)
+    return (
+        "<p:sp>"
+        f'<p:nvSpPr><p:cNvPr id="{shape_id}" name="PDF text"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>'
+        f'<p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{width}" cy="{height}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln><a:noFill/></a:ln></p:spPr>'
+        f'{ppt_text_body_xml(str(cell["text"]), int(cell.get("style", 0)))}'
+        "</p:sp>"
+    )
+
+
+def ppt_image_shape_xml(shape_id: int, rel_id: str, image: dict) -> str:
+    rect = image["rect"]
+    return (
+        "<p:pic>"
+        f'<p:nvPicPr><p:cNvPr id="{shape_id}" name="PDF image"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>'
+        f'<p:blipFill><a:blip r:embed="{rel_id}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>'
+        f'<p:spPr><a:xfrm><a:off x="{int(rect.x0 * 12700)}" y="{int(rect.y0 * 12700)}"/><a:ext cx="{max(int(rect.width * 12700), 1)}" cy="{max(int(rect.height * 12700), 1)}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>'
+        "</p:pic>"
+    )
+
+
+def ppt_slide_xml(page: dict, slide_index: int) -> str:
+    shapes = [
+        '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
+        '<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>'
+    ]
+    shape_id = 2
+    for row_index, row in enumerate(page["cells"], start=1):
+        for cell in sorted(row, key=lambda item: int(item["col"])):
+            shapes.append(ppt_text_shape_xml(shape_id, cell, row_index, page))
+            shape_id += 1
+    for image_index, image in enumerate(page["images"], start=1):
+        shapes.append(ppt_image_shape_xml(shape_id, f"rIdImage{image_index}", image))
+        shape_id += 1
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+        'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">'
+        f'<p:cSld name="Page {slide_index}"><p:spTree>{"".join(shapes)}</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>'
+        "</p:sld>"
+    )
+
+
+def ppt_slide_rels_xml(images: list[dict], first_media_index: int) -> str:
+    rels = [
+        '<Relationship Id="rIdLayout" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>'
+    ]
+    for index, image in enumerate(images, start=1):
+        media_index = first_media_index + index - 1
+        rels.append(
+            f'<Relationship Id="rIdImage{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image{media_index}.{image["extension"]}"/>'
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'{"".join(rels)}</Relationships>'
+    )
+
+
+def ppt_slide_master_xml() -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<p:sldMaster xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+        'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">'
+        '<p:cSld><p:spTree>'
+        '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
+        '<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>'
+        '</p:spTree></p:cSld>'
+        '<p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/>'
+        '<p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rIdLayout1"/></p:sldLayoutIdLst>'
+        '<p:txStyles><p:titleStyle/><p:bodyStyle/><p:otherStyle/></p:txStyles>'
+        "</p:sldMaster>"
+    )
+
+
+def ppt_slide_master_rels_xml() -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rIdLayout1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>'
+        '<Relationship Id="rIdTheme1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="../theme/theme1.xml"/>'
+        "</Relationships>"
+    )
+
+
+def ppt_slide_layout_xml() -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<p:sldLayout xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+        'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" type="blank" preserve="1">'
+        '<p:cSld name="Blank"><p:spTree>'
+        '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
+        '<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>'
+        '</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>'
+        "</p:sldLayout>"
+    )
+
+
+def ppt_slide_layout_rels_xml() -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rIdMaster1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/>'
+        "</Relationships>"
+    )
+
+
+def ppt_theme_xml() -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="We Love PDF">'
+        '<a:themeElements><a:clrScheme name="Office">'
+        '<a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1><a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>'
+        '<a:dk2><a:srgbClr val="1F1F1F"/></a:dk2><a:lt2><a:srgbClr val="F7F7F8"/></a:lt2>'
+        '<a:accent1><a:srgbClr val="E5322D"/></a:accent1><a:accent2><a:srgbClr val="2458D3"/></a:accent2>'
+        '<a:accent3><a:srgbClr val="626262"/></a:accent3><a:accent4><a:srgbClr val="FFFFFF"/></a:accent4>'
+        '<a:accent5><a:srgbClr val="B91D18"/></a:accent5><a:accent6><a:srgbClr val="171717"/></a:accent6>'
+        '<a:hlink><a:srgbClr val="2458D3"/></a:hlink><a:folHlink><a:srgbClr val="5A3E8C"/></a:folHlink>'
+        '</a:clrScheme><a:fontScheme name="Office"><a:majorFont><a:latin typeface="Calibri"/></a:majorFont><a:minorFont><a:latin typeface="Calibri"/></a:minorFont></a:fontScheme><a:fmtScheme name="Office"><a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst><a:lnStyleLst><a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></a:lnStyleLst><a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst><a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:bgFillStyleLst></a:fmtScheme></a:themeElements>'
+        '<a:objectDefaults/><a:extraClrSchemeLst/>'
+        "</a:theme>"
+    )
+
+
+def create_ppt_from_refs(workdir: Path, refs: list[dict]) -> tuple[Path, str]:
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.util import Emu, Pt
+
+    original_stem, pages = selected_page_packages(workdir, refs)
+    out = output_path(workdir, f"converted-{original_stem}.pptx")
+    deck = Presentation()
+    deck.slide_width = Emu(10058400)
+    deck.slide_height = Emu(7543800)
+    blank_layout = deck.slide_layouts[6]
+    if len(deck.slides) == 1 and not deck.slides[0].shapes:
+        deck.slides._sldIdLst.remove(deck.slides._sldIdLst[0])
+
+    for page in pages:
+        slide = deck.slides.add_slide(blank_layout)
+        scale = min(float(deck.slide_width) / page["width"], float(deck.slide_height) / page["height"])
+
+        for row_index, row in enumerate(page["cells"], start=1):
+            for cell in sorted(row, key=lambda item: int(item["col"])):
+                left = Emu(int(((int(cell["col"]) - 1) * 140 + 24) * 12700))
+                top = Emu(int((row_index * 24 + 32) * 12700))
+                width = Emu(int(128 * 12700))
+                height = Emu(int(22 * 12700))
+                box = slide.shapes.add_textbox(left, top, width, height)
+                frame = box.text_frame
+                frame.margin_left = 0
+                frame.margin_right = 0
+                frame.margin_top = 0
+                frame.margin_bottom = 0
+                paragraph = frame.paragraphs[0]
+                run = paragraph.add_run()
+                run.text = str(cell["text"])
+                run.font.size = Pt(12)
+                run.font.name = "Calibri"
+                run.font.color.rgb = RGBColor(0, 0, 0)
+                style = int(cell.get("style", 0))
+                run.font.bold = style in {1, 3}
+                run.font.italic = style in {2, 3}
+
+        for image in page["images"]:
+            rect = image["rect"]
+            slide.shapes.add_picture(
+                io.BytesIO(image["bytes"]),
+                Emu(int(rect.x0 * scale)),
+                Emu(int(rect.y0 * scale)),
+                width=Emu(max(int(rect.width * scale), 1)),
+                height=Emu(max(int(rect.height * scale), 1)),
+            )
+
+    deck.save(out)
+    return out, f"converted-{original_stem}.pptx"
+
+
 def document_from_range(workdir: Path, document_id: str, start: int, end: int) -> fitz.Document:
     path = find_document(workdir, document_id)
     result = fitz.open()
@@ -1024,6 +1360,24 @@ def generate_from_preview(tool: str):
             out,
             download_name,
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    if tool == "word":
+        out, download_name = create_word_from_refs(workdir, refs)
+        logger.info("generate.output tool=%s session=%s pages=%s", tool, log_session_id(sid), len(refs))
+        return send_download(
+            out,
+            download_name,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
+    if tool == "ppt":
+        out, download_name = create_ppt_from_refs(workdir, refs)
+        logger.info("generate.output tool=%s session=%s pages=%s", tool, log_session_id(sid), len(refs))
+        return send_download(
+            out,
+            download_name,
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         )
 
     result = document_from_refs(workdir, refs)
