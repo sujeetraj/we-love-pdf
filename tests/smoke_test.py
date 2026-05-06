@@ -31,6 +31,8 @@ def table_pdf_with_image() -> bytes:
     page.insert_text((72, 96), "Alice", fontsize=12)
     page.insert_text((220, 96), "100", fontsize=12)
     page.insert_image(fitz.Rect(72, 130, 122, 180), stream=red_png)
+    page.draw_rect(fitz.Rect(72, 200, 220, 232), fill=(0, 0, 0), color=(0, 0, 0))
+    page.insert_text((80, 220), "WhiteText", fontsize=12, color=(1, 1, 1))
     data = doc.tobytes(garbage=4, deflate=True)
     doc.close()
     return data
@@ -306,6 +308,9 @@ class SmokeTest(unittest.TestCase):
         self.assertIn('b="1"', slide_xml)
         self.assertIn("Name", slide_xml)
         self.assertIn("Alice", slide_xml)
+        self.assertIn("WhiteText", slide_xml)
+        self.assertIn('val="FFFFFF"', slide_xml)
+        self.assertLess(slide_xml.index("<p:pic>"), slide_xml.index("<a:t>Name</a:t>"))
         self.assertIn("ppt/media/image1.png", names)
 
     def test_invalid_pdf_error_is_generic(self):

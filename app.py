@@ -421,9 +421,14 @@ def span_styles(page: fitz.Page) -> list[dict]:
                     {
                         "rect": fitz.Rect(span.get("bbox", (0, 0, 0, 0))),
                         "style": excel_style_from_flags(int(span.get("flags", 0))),
+                        "color": pdf_color_to_rgb(int(span.get("color", 0))),
                     }
                 )
     return spans
+
+
+def pdf_color_to_rgb(color: int) -> tuple[int, int, int]:
+    return ((color >> 16) & 255, (color >> 8) & 255, color & 255)
 
 
 def excel_style_from_flags(flags: int) -> int:
@@ -444,6 +449,39 @@ def style_for_word(spans: list[dict], x: float, y: float) -> int:
         if point in span["rect"]:
             return int(span["style"])
     return 0
+
+
+def color_for_word(spans: list[dict], x: float, y: float) -> tuple[int, int, int]:
+    point = fitz.Point(x, y)
+    for span in spans:
+        if point in span["rect"]:
+            return span["color"]
+    return (0, 0, 0)
+
+
+def positioned_text_runs_from_page(page: fitz.Page) -> list[dict]:
+    runs = []
+    for block in page.get_text("dict").get("blocks", []):
+        check_operation_budget()
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = str(span.get("text", "")).strip()
+                if not text:
+                    continue
+                rect = fitz.Rect(span.get("bbox", (0, 0, 0, 0)))
+                runs.append(
+                    {
+                        "text": text,
+                        "rect": rect,
+                        "style": excel_style_from_flags(int(span.get("flags", 0))),
+                        "color": pdf_color_to_rgb(int(span.get("color", 0))),
+                        "size": max(float(span.get("size", 12)), 6),
+                        "font": str(span.get("font", "Calibri")),
+                    }
+                )
+    return runs
 
 
 def cluster_columns(x_positions: list[float]) -> list[float]:
@@ -478,6 +516,7 @@ def worksheet_cells_from_page(page: fitz.Page) -> tuple[list[list[dict]], list[f
                 "x1": float(x1),
                 "text": str(text),
                 "style": style_for_word(styles, (float(x0) + float(x1)) / 2, midpoint_y),
+                "color": color_for_word(styles, (float(x0) + float(x1)) / 2, midpoint_y),
             }
         )
 
@@ -488,22 +527,25 @@ def worksheet_cells_from_page(page: fitz.Page) -> tuple[list[list[dict]], list[f
         current_words: list[str] = []
         current_x = 0.0
         current_style = 0
+        current_color = (0, 0, 0)
         previous_x1: float | None = None
         for word in sorted(row, key=lambda item: item["x0"]):
             if previous_x1 is not None and word["x0"] - previous_x1 > 18 and current_words:
-                chunks.append({"x": current_x, "text": " ".join(current_words), "style": current_style})
+                chunks.append({"x": current_x, "text": " ".join(current_words), "style": current_style, "color": current_color})
                 x_positions.append(current_x)
                 current_words = []
                 current_style = 0
+                current_color = (0, 0, 0)
             if not current_words:
                 current_x = word["x0"]
                 current_style = word["style"]
+                current_color = word["color"]
             else:
                 current_style = max(current_style, word["style"])
             current_words.append(word["text"])
             previous_x1 = word["x1"]
         if current_words:
-            chunks.append({"x": current_x, "text": " ".join(current_words), "style": current_style})
+            chunks.append({"x": current_x, "text": " ".join(current_words), "style": current_style, "color": current_color})
             x_positions.append(current_x)
         if chunks:
             row_chunks.append(chunks)
@@ -520,6 +562,7 @@ def worksheet_cells_from_page(page: fitz.Page) -> tuple[list[list[dict]], list[f
                     "col": nearest_column(columns, cell["x"]),
                     "text": cell["text"],
                     "style": cell["style"],
+                    "color": cell["color"],
                 }
                 for cell in row
             ]
@@ -782,6 +825,7 @@ def selected_page_packages(workdir: Path, refs: list[dict]) -> tuple[str, list[d
                     "width": float(page.rect.width),
                     "height": float(page.rect.height),
                     "cells": cells,
+                    "text_runs": positioned_text_runs_from_page(page),
                     "column_count": max(len(columns), 1),
                     "images": extract_page_images(doc, page),
                 }
@@ -1061,28 +1105,6 @@ def create_ppt_from_refs(workdir: Path, refs: list[dict]) -> tuple[Path, str]:
         slide = deck.slides.add_slide(blank_layout)
         scale = min(float(deck.slide_width) / page["width"], float(deck.slide_height) / page["height"])
 
-        for row_index, row in enumerate(page["cells"], start=1):
-            for cell in sorted(row, key=lambda item: int(item["col"])):
-                left = Emu(int(((int(cell["col"]) - 1) * 140 + 24) * 12700))
-                top = Emu(int((row_index * 24 + 32) * 12700))
-                width = Emu(int(128 * 12700))
-                height = Emu(int(22 * 12700))
-                box = slide.shapes.add_textbox(left, top, width, height)
-                frame = box.text_frame
-                frame.margin_left = 0
-                frame.margin_right = 0
-                frame.margin_top = 0
-                frame.margin_bottom = 0
-                paragraph = frame.paragraphs[0]
-                run = paragraph.add_run()
-                run.text = str(cell["text"])
-                run.font.size = Pt(12)
-                run.font.name = "Calibri"
-                run.font.color.rgb = RGBColor(0, 0, 0)
-                style = int(cell.get("style", 0))
-                run.font.bold = style in {1, 3}
-                run.font.italic = style in {2, 3}
-
         for image in page["images"]:
             rect = image["rect"]
             slide.shapes.add_picture(
@@ -1092,6 +1114,46 @@ def create_ppt_from_refs(workdir: Path, refs: list[dict]) -> tuple[Path, str]:
                 width=Emu(max(int(rect.width * scale), 1)),
                 height=Emu(max(int(rect.height * scale), 1)),
             )
+
+        text_runs = page["text_runs"]
+        if not text_runs:
+            for row_index, row in enumerate(page["cells"], start=1):
+                for cell in sorted(row, key=lambda item: int(item["col"])):
+                    text_runs.append(
+                        {
+                            "text": str(cell["text"]),
+                            "rect": fitz.Rect((int(cell["col"]) - 1) * 140 + 24, row_index * 24 + 32, int(cell["col"]) * 140 + 152, row_index * 24 + 54),
+                            "style": int(cell.get("style", 0)),
+                            "color": cell.get("color", (0, 0, 0)),
+                            "size": 12,
+                            "font": "Calibri",
+                        }
+                    )
+
+        for item in text_runs:
+            rect = item["rect"]
+            box = slide.shapes.add_textbox(
+                Emu(int(rect.x0 * scale)),
+                Emu(int(rect.y0 * scale)),
+                Emu(max(int(rect.width * scale), 1)),
+                Emu(max(int(rect.height * scale), 1)),
+            )
+            frame = box.text_frame
+            frame.margin_left = 0
+            frame.margin_right = 0
+            frame.margin_top = 0
+            frame.margin_bottom = 0
+            frame.word_wrap = False
+            paragraph = frame.paragraphs[0]
+            run = paragraph.add_run()
+            run.text = str(item["text"])
+            run.font.size = Pt(max(float(item.get("size", 12)) * scale / 12700, 6))
+            run.font.name = "Calibri"
+            red, green, blue = item.get("color", (0, 0, 0))
+            run.font.color.rgb = RGBColor(red, green, blue)
+            style = int(item.get("style", 0))
+            run.font.bold = style in {1, 3}
+            run.font.italic = style in {2, 3}
 
     deck.save(out)
     return out, f"converted-{original_stem}.pptx"
