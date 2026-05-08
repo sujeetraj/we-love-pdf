@@ -21,6 +21,16 @@ body {
   color: var(--ink);
 }
 
+.site-footer {
+  display: flex;
+  justify-content: center;
+  padding: 22px 16px 28px;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 700;
+  text-align: center;
+}
+
 button,
 input,
 select,
