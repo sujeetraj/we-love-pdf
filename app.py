@@ -570,6 +570,124 @@ def worksheet_cells_from_page(page: fitz.Page) -> tuple[list[list[dict]], list[f
     return sparse_rows, columns
 
 
+def rotated_rect(rect: fitz.Rect, page: fitz.Page) -> fitz.Rect:
+    return rect * page.rotation_matrix
+
+
+def clustered_positions(values: list[float], tolerance: float = 1.25) -> list[float]:
+    groups: list[list[float]] = []
+    for value in sorted(values):
+        if not groups or abs(value - groups[-1][-1]) > tolerance:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    return [sum(group) / len(group) for group in groups]
+
+
+def page_line_grid(page: fitz.Page) -> tuple[list[float], list[float], list[tuple[float, float, float]]]:
+    x_positions: list[float] = []
+    y_positions: list[float] = []
+    vertical_segments: list[tuple[float, float, float]] = []
+    matrix = page.rotation_matrix
+    for drawing in page.get_drawings():
+        check_operation_budget()
+        for item in drawing.get("items", []):
+            if not item or item[0] != "l":
+                continue
+            start = item[1] * matrix
+            end = item[2] * matrix
+            if abs(start.x - end.x) < 0.75 and abs(start.y - end.y) > 8:
+                x_positions.append(start.x)
+                y_positions.extend([start.y, end.y])
+                vertical_segments.append((start.x, min(start.y, end.y), max(start.y, end.y)))
+            elif abs(start.y - end.y) < 0.75 and abs(start.x - end.x) > 8:
+                y_positions.append(start.y)
+                x_positions.extend([start.x, end.x])
+    x_lines = clustered_positions(x_positions)
+    y_lines = clustered_positions(y_positions)
+    return x_lines, y_lines, vertical_segments
+
+
+def has_vertical_separator(x: float, y_top: float, y_bottom: float, segments: list[tuple[float, float, float]]) -> bool:
+    midpoint = (y_top + y_bottom) / 2
+    for segment_x, segment_top, segment_bottom in segments:
+        if abs(segment_x - x) <= 1.5 and segment_top - 1 <= midpoint <= segment_bottom + 1:
+            return True
+    return False
+
+
+def excel_cells_from_page_grid(page: fitz.Page) -> dict:
+    import bisect
+
+    x_lines, y_lines, vertical_segments = page_line_grid(page)
+    if len(x_lines) < 2 or len(y_lines) < 2:
+        rows, columns = worksheet_cells_from_page(page)
+        return {"mode": "flow", "x_lines": columns, "y_lines": list(range(len(rows) + 1)), "rows": rows, "spans": []}
+
+    styles = span_styles(page)
+    cells: dict[tuple[int, int], list[dict]] = {}
+    matrix = page.rotation_matrix
+    for word in page.get_text("words"):
+        check_operation_budget()
+        original = fitz.Rect(word[:4])
+        rect = original * matrix
+        x_mid = (rect.x0 + rect.x1) / 2
+        y_mid = (rect.y0 + rect.y1) / 2
+        column = bisect.bisect_right(x_lines, x_mid) - 1
+        row = bisect.bisect_right(y_lines, y_mid) - 1
+        if row < 0 or column < 0 or row >= len(y_lines) - 1 or column >= len(x_lines) - 1:
+            continue
+        original_mid_x = (original.x0 + original.x1) / 2
+        original_mid_y = (original.y0 + original.y1) / 2
+        cells.setdefault((row, column), []).append(
+            {
+                "x": rect.x0,
+                "y": rect.y0,
+                "text": str(word[4]),
+                "style": style_for_word(styles, original_mid_x, original_mid_y),
+                "color": color_for_word(styles, original_mid_x, original_mid_y),
+            }
+        )
+
+    rows: list[list[dict]] = []
+    row_spans: list[list[tuple[int, int]]] = []
+    for row_index in range(len(y_lines) - 1):
+        row_cells: list[dict] = []
+        spans: list[tuple[int, int]] = []
+        span_start = 0
+        for column_index in range(len(x_lines) - 1):
+            words = cells.get((row_index, column_index), [])
+            if not words:
+                row_cells.append({"col": column_index + 1, "text": "", "style": 0, "color": (0, 0, 0)})
+            else:
+                words.sort(key=lambda item: (round(item["y"], 1), item["x"]))
+                text = " ".join(item["text"] for item in words)
+                row_cells.append(
+                    {
+                        "col": column_index + 1,
+                        "text": text,
+                        "style": max(int(item["style"]) for item in words),
+                        "color": words[0]["color"],
+                    }
+                )
+            if column_index < len(x_lines) - 2 and has_vertical_separator(
+                x_lines[column_index + 1],
+                y_lines[row_index],
+                y_lines[row_index + 1],
+                vertical_segments,
+            ):
+                spans.append((span_start, column_index))
+                span_start = column_index + 1
+        spans.append((span_start, len(x_lines) - 2))
+        row_spans.append(spans)
+        rows.append(row_cells)
+    return {"mode": "grid", "x_lines": x_lines, "y_lines": y_lines, "rows": rows, "spans": row_spans}
+
+
+def xlsx_color(rgb: tuple[int, int, int]) -> str:
+    return f"#{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}"
+
+
 def extract_page_images(doc: fitz.Document, page: fitz.Page) -> list[dict]:
     images = []
     for image in page.get_images(full=True):
@@ -690,10 +808,12 @@ def original_upload_stem(path: Path) -> str:
 
 
 def create_excel_from_refs(workdir: Path, refs: list[dict]) -> tuple[Path, str]:
+    import xlsxwriter
+
     first_path = find_document(workdir, str(refs[0].get("documentId", "")))
     original_stem = original_upload_stem(first_path)
     out = output_path(workdir, f"converted-{original_stem}.xlsx")
-    sheets: list[dict] = []
+    pages: list[dict] = []
     for index, ref in enumerate(refs, start=1):
         check_operation_budget()
         document_id = str(ref.get("documentId", ""))
@@ -704,103 +824,105 @@ def create_excel_from_refs(workdir: Path, refs: list[dict]) -> tuple[Path, str]:
             if page_number < 1 or page_number > doc.page_count:
                 abort(400, "Invalid page in preview")
             page = doc[page_number - 1]
-            cells, columns = worksheet_cells_from_page(page)
-            sheets.append(
+            grid = excel_cells_from_page_grid(page)
+            pages.append(
                 {
                     "name": f"Page {index}",
-                    "cells": cells,
-                    "column_count": max(len(columns), 1),
+                    "grid": grid,
                     "images": extract_page_images(doc, page),
+                    "matrix": page.rotation_matrix,
                 }
             )
 
-    sheet_defs = "".join(
-        f'<sheet name="{escape(sheet["name"])}" sheetId="{index}" r:id="rId{index}"/>'
-        for index, sheet in enumerate(sheets, start=1)
-    )
-    workbook_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        f"<sheets>{sheet_defs}</sheets>"
-        "</workbook>"
-    )
-    rels_xml = "".join(
-        f'<Relationship Id="rId{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{index}.xml"/>'
-        for index in range(1, len(sheets) + 1)
-    )
-    rels_xml += '<Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
-    workbook_rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        f"{rels_xml}</Relationships>"
-    )
-    sheet_overrides = "".join(
-        f'<Override PartName="/xl/worksheets/sheet{index}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-        for index in range(1, len(sheets) + 1)
-    )
-    drawing_overrides = "".join(
-        f'<Override PartName="/xl/drawings/drawing{index}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>'
-        for index, sheet in enumerate(sheets, start=1)
-        if sheet["images"]
-    )
-    content_types = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-        '<Default Extension="xml" ContentType="application/xml"/>'
-        '<Default Extension="png" ContentType="image/png"/>'
-        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
-        f"{sheet_overrides}{drawing_overrides}</Types>"
-    )
-    root_rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
-        "</Relationships>"
-    )
-    styles_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        '<fonts count="4">'
-        '<font><sz val="11"/><name val="Calibri"/></font>'
-        '<font><b/><sz val="11"/><name val="Calibri"/></font>'
-        '<font><i/><sz val="11"/><name val="Calibri"/></font>'
-        '<font><b/><i/><sz val="11"/><name val="Calibri"/></font>'
-        '</fonts>'
-        '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>'
-        '<borders count="1"><border/></borders>'
-        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-        '<cellXfs count="4">'
-        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
-        '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
-        '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
-        '<xf numFmtId="0" fontId="3" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
-        '</cellXfs>'
-        "</styleSheet>"
-    )
+    workbook = xlsxwriter.Workbook(out)
+    worksheet = workbook.add_worksheet("Converted")
+    worksheet.hide_gridlines(2)
+    worksheet.set_landscape()
+    worksheet.set_margins(0.25, 0.25, 0.35, 0.35)
+    format_cache: dict[tuple, object] = {}
 
-    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", content_types)
-        archive.writestr("_rels/.rels", root_rels)
-        archive.writestr("xl/workbook.xml", workbook_xml)
-        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
-        archive.writestr("xl/styles.xml", styles_xml)
-        media_index = 1
-        for index, sheet in enumerate(sheets, start=1):
-            images = sheet["images"]
-            archive.writestr(
-                f"xl/worksheets/sheet{index}.xml",
-                worksheet_xml(sheet["cells"], int(sheet["column_count"]), bool(images)),
+    def cell_format(style: int = 0, color: tuple[int, int, int] = (0, 0, 0), header: bool = False, border: bool = True):
+        key = (style, color, header, border)
+        if key not in format_cache:
+            props = {
+                "font_name": "Arial",
+                "font_size": 9 if not header else 8,
+                "font_color": xlsx_color(color),
+                "valign": "vcenter",
+                "text_wrap": True,
+            }
+            if border:
+                props.update({"border": 1, "border_color": "#808080"})
+            if style in {1, 3} or header:
+                props["bold"] = True
+            if style in {2, 3}:
+                props["italic"] = True
+            if header:
+                props.update({"align": "center", "bg_color": "#F3F3F3"})
+            format_cache[key] = workbook.add_format(props)
+        return format_cache[key]
+
+    row_offset = 0
+    max_columns = 1
+    for page_index, page_data in enumerate(pages, start=1):
+        grid = page_data["grid"]
+        x_lines = grid["x_lines"]
+        y_lines = grid["y_lines"]
+        rows = grid["rows"]
+        if page_index > 1:
+            row_offset += 2
+        max_columns = max(max_columns, max((len(row) for row in rows), default=1))
+
+        if grid["mode"] == "grid":
+            for column_index in range(max(1, len(x_lines) - 1)):
+                width = max(4.0, min((x_lines[column_index + 1] - x_lines[column_index]) / 6.5, 26.0))
+                worksheet.set_column(column_index, column_index, width)
+            for row_index, row in enumerate(rows):
+                height = max(14, min((y_lines[row_index + 1] - y_lines[row_index]) * 0.78, 42))
+                worksheet.set_row(row_offset + row_index, height)
+                has_numeric_serial = any(cell["text"].strip().isdigit() for cell in row[:1])
+                header = row_index < 12 and not has_numeric_serial
+                for start_column, end_column in grid["spans"][row_index]:
+                    span_cells = row[start_column : end_column + 1]
+                    text_parts = [cell["text"].strip() for cell in span_cells if cell["text"].strip()]
+                    text = " ".join(text_parts)
+                    styled = next((cell for cell in span_cells if cell["text"].strip()), span_cells[0])
+                    fmt = cell_format(int(styled.get("style", 0)), styled.get("color", (0, 0, 0)), header=header)
+                    if end_column > start_column:
+                        worksheet.merge_range(row_offset + row_index, start_column, row_offset + row_index, end_column, text, fmt)
+                    elif text:
+                        worksheet.write(row_offset + row_index, start_column, text, fmt)
+                    else:
+                        worksheet.write_blank(row_offset + row_index, start_column, None, fmt)
+        else:
+            for row_index, row in enumerate(rows):
+                for cell in row:
+                    fmt = cell_format(int(cell.get("style", 0)), cell.get("color", (0, 0, 0)), border=False)
+                    worksheet.write(row_offset + row_index, int(cell["col"]) - 1, cell["text"], fmt)
+
+        for image in page_data["images"]:
+            rect = image["rect"] * page_data["matrix"]
+            anchor_row = row_offset
+            anchor_col = 1
+            if grid["mode"] == "grid":
+                anchor_row = row_offset + max(0, min(len(y_lines) - 2, next((i for i, y in enumerate(y_lines[1:]) if y >= rect.y0), 0)))
+                anchor_col = max(0, min(len(x_lines) - 2, next((i for i, x in enumerate(x_lines[1:]) if x >= rect.x0), 1)))
+            worksheet.insert_image(
+                anchor_row,
+                anchor_col,
+                "image.png",
+                {
+                    "image_data": io.BytesIO(image["bytes"]),
+                    "x_scale": min(rect.width / 80, 1.0),
+                    "y_scale": min(rect.height / 80, 1.0),
+                    "object_position": 1,
+                },
             )
-            if images:
-                archive.writestr(f"xl/worksheets/_rels/sheet{index}.xml.rels", worksheet_rels_xml(index))
-                archive.writestr(f"xl/drawings/drawing{index}.xml", drawing_xml(images))
-                archive.writestr(f"xl/drawings/_rels/drawing{index}.xml.rels", drawing_rels_xml(images, media_index))
-                for image in images:
-                    archive.writestr(f"xl/media/image{media_index}.{image['extension']}", image["bytes"])
-                    media_index += 1
+        row_offset += len(rows)
+
+    worksheet.freeze_panes(1, 0)
+    worksheet.autofilter(0, 0, max(row_offset - 1, 0), max_columns - 1)
+    workbook.close()
     return out, f"converted-{original_stem}.xlsx"
 
 
