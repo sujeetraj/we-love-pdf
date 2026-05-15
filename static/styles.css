@@ -1448,7 +1448,8 @@ textarea {
   color: var(--red-dark);
 }
 
-.completion-modal {
+.completion-modal,
+.progress-modal {
   position: fixed;
   inset: 0;
   z-index: 50;
@@ -1456,6 +1457,11 @@ textarea {
   place-items: center;
   padding: 24px;
   background: rgba(23, 23, 23, 0.34);
+}
+
+.completion-modal[hidden],
+.progress-modal[hidden] {
+  display: none;
 }
 
 .completion-panel {
@@ -1496,6 +1502,67 @@ textarea {
 
 .completion-panel .primary {
   min-width: 190px;
+}
+
+.progress-panel {
+  width: min(520px, 100%);
+  display: grid;
+  justify-items: stretch;
+  gap: 14px;
+  padding: 34px;
+  border-radius: 8px;
+  background: #fff;
+  text-align: center;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.24);
+}
+
+.progress-panel h2 {
+  margin: 0;
+  font-size: 30px;
+}
+
+.progress-panel p:not(.eyebrow) {
+  margin: 0;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1.45;
+}
+
+.progress-meter {
+  height: 14px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #f0f0f1;
+  border: 1px solid #e0e0e2;
+}
+
+.progress-meter span {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--red);
+  transition: width 220ms ease;
+}
+
+.progress-percent {
+  color: var(--ink);
+  font-size: 28px;
+  font-weight: 900;
+}
+
+.progress-panel.error .progress-meter span {
+  background: var(--red-dark);
+}
+
+.progress-panel.error .progress-percent {
+  color: var(--red-dark);
+}
+
+.progress-panel .ghost {
+  justify-self: center;
+  min-width: 130px;
+  min-height: 42px;
 }
 
 .page-count {

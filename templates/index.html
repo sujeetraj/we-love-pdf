@@ -240,6 +240,18 @@
           <button class="primary" id="anotherTaskBtn" type="button">Do another task</button>
         </div>
       </div>
+      <div class="progress-modal" id="progressModal" hidden role="dialog" aria-modal="true" aria-labelledby="progressTitle">
+        <div class="progress-panel">
+          <p class="eyebrow">Processing</p>
+          <h2 id="progressTitle">Generating output</h2>
+          <div class="progress-meter" aria-hidden="true">
+            <span id="progressFill"></span>
+          </div>
+          <div class="progress-percent" id="progressPercent">0%</div>
+          <p id="progressMessage">Please keep this browser tab open while your file is prepared.</p>
+          <button class="ghost" id="progressCloseBtn" type="button" hidden>Close</button>
+        </div>
+      </div>
     </main>
     <footer class="site-footer">
       Developed by API IT and Security with ♥️

@@ -570,6 +570,41 @@ def worksheet_cells_from_page(page: fitz.Page) -> tuple[list[list[dict]], list[f
     return sparse_rows, columns
 
 
+def visual_cells_from_page(page: fitz.Page) -> tuple[list[list[dict]], list[float]]:
+    words = sorted(page.get_text("words"), key=lambda word: (round(word[1], 1), word[0]))
+    styles = span_styles(page)
+    rows: list[list[dict]] = []
+    current_y: float | None = None
+    page_width = max(float(page.rect.width), 1.0)
+    visual_column_width = max(page_width / 10, 45)
+    columns = [index * visual_column_width for index in range(12)]
+
+    for word in words:
+        check_operation_budget()
+        x0, y0, x1, y1, text = word[:5]
+        midpoint_y = (float(y0) + float(y1)) / 2
+        if current_y is None or abs(midpoint_y - current_y) > 5:
+            rows.append([])
+            current_y = midpoint_y
+        col = max(1, min(12, int(float(x0) / visual_column_width) + 1))
+        if rows[-1] and rows[-1][-1]["col"] == col:
+            rows[-1][-1]["text"] = f'{rows[-1][-1]["text"]} {text}'
+            rows[-1][-1]["style"] = max(int(rows[-1][-1]["style"]), style_for_word(styles, (float(x0) + float(x1)) / 2, midpoint_y))
+        else:
+            rows[-1].append(
+                {
+                    "col": col,
+                    "text": str(text),
+                    "style": style_for_word(styles, (float(x0) + float(x1)) / 2, midpoint_y),
+                    "color": color_for_word(styles, (float(x0) + float(x1)) / 2, midpoint_y),
+                }
+            )
+
+    if not rows:
+        return [[{"col": 1, "text": "No selectable text found on this page", "style": 0, "color": (0, 0, 0)}]], [0]
+    return rows, columns
+
+
 def rotated_rect(rect: fitz.Rect, page: fitz.Page) -> fitz.Rect:
     return rect * page.rotation_matrix
 
@@ -616,13 +651,110 @@ def has_vertical_separator(x: float, y_top: float, y_bottom: float, segments: li
     return False
 
 
+def text_row_chunks(page: fitz.Page, gap_threshold: float = 18) -> list[list[dict]]:
+    words = sorted(page.get_text("words"), key=lambda word: (round(word[1], 1), word[0]))
+    rows: list[list[dict]] = []
+    current_y: float | None = None
+    for word in words:
+        check_operation_budget()
+        x0, y0, x1, y1, text = word[:5]
+        midpoint_y = (float(y0) + float(y1)) / 2
+        if current_y is None or abs(midpoint_y - current_y) > 5:
+            rows.append([])
+            current_y = midpoint_y
+        rows[-1].append({"x0": float(x0), "x1": float(x1), "text": str(text)})
+
+    chunked_rows: list[list[dict]] = []
+    for row in rows:
+        chunks: list[dict] = []
+        current_words: list[str] = []
+        current_x = 0.0
+        previous_x1: float | None = None
+        for word in sorted(row, key=lambda item: item["x0"]):
+            if previous_x1 is not None and word["x0"] - previous_x1 > gap_threshold and current_words:
+                chunks.append({"x": current_x, "text": " ".join(current_words)})
+                current_words = []
+            if not current_words:
+                current_x = word["x0"]
+            current_words.append(word["text"])
+            previous_x1 = word["x1"]
+        if current_words:
+            chunks.append({"x": current_x, "text": " ".join(current_words)})
+        if chunks:
+            chunked_rows.append(chunks)
+    return chunked_rows
+
+
+def excel_page_profile(page: fitz.Page) -> dict:
+    words = page.get_text("words")
+    blocks = page.get_text("blocks")
+    x_lines, y_lines, vertical_segments = page_line_grid(page)
+    chunks = text_row_chunks(page)
+    multi_chunk_rows = sum(1 for row in chunks if len(row) > 1)
+    populated_rows = len(chunks)
+    x_positions = [chunk["x"] for row in chunks for chunk in row]
+    clustered_x = cluster_columns(x_positions) if x_positions else []
+    image_count = len(page.get_images(full=True))
+    word_count = len(words)
+    grid_score = min(len(x_lines), 14) * min(len(y_lines), 14) + min(len(vertical_segments), 30)
+    aligned_score = multi_chunk_rows / max(populated_rows, 1)
+    has_repeating_columns = len(clustered_x) >= 2 and multi_chunk_rows >= 2
+
+    if word_count == 0 and image_count:
+        strategy = "image_only"
+    elif len(x_lines) >= 3 and len(y_lines) >= 3 and grid_score >= 20:
+        strategy = "ruled_table"
+    elif has_repeating_columns and aligned_score >= 0.35:
+        strategy = "aligned_table"
+    elif populated_rows >= 4 and multi_chunk_rows >= 2:
+        strategy = "key_value_or_form"
+    elif word_count == 0:
+        strategy = "empty_or_scanned"
+    else:
+        strategy = "visual_text"
+
+    return {
+        "strategy": strategy,
+        "word_count": word_count,
+        "block_count": len(blocks),
+        "image_count": image_count,
+        "x_lines": x_lines,
+        "y_lines": y_lines,
+        "vertical_segments": vertical_segments,
+        "chunks": chunks,
+        "clustered_x": clustered_x,
+    }
+
+
+def render_page_snapshot(page: fitz.Page) -> bytes:
+    pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+    return pix.tobytes("png")
+
+
 def excel_cells_from_page_grid(page: fitz.Page) -> dict:
     import bisect
 
-    x_lines, y_lines, vertical_segments = page_line_grid(page)
-    if len(x_lines) < 2 or len(y_lines) < 2:
-        rows, columns = worksheet_cells_from_page(page)
-        return {"mode": "flow", "x_lines": columns, "y_lines": list(range(len(rows) + 1)), "rows": rows, "spans": []}
+    profile = excel_page_profile(page)
+    strategy = profile["strategy"]
+    x_lines = profile["x_lines"]
+    y_lines = profile["y_lines"]
+    vertical_segments = profile["vertical_segments"]
+    if strategy in {"image_only", "empty_or_scanned"}:
+        return {
+            "mode": "image",
+            "strategy": strategy,
+            "x_lines": [0, page.rect.width],
+            "y_lines": [0, page.rect.height],
+            "rows": [[{"col": 1, "text": "This page has no selectable table text. A page image was preserved for review.", "style": 0, "color": (0, 0, 0)}]],
+            "spans": [],
+            "snapshot": render_page_snapshot(page),
+        }
+    if strategy != "ruled_table" or len(x_lines) < 2 or len(y_lines) < 2:
+        if strategy == "visual_text":
+            rows, columns = visual_cells_from_page(page)
+        else:
+            rows, columns = worksheet_cells_from_page(page)
+        return {"mode": "flow", "strategy": strategy, "x_lines": columns, "y_lines": list(range(len(rows) + 1)), "rows": rows, "spans": []}
 
     styles = span_styles(page)
     cells: dict[tuple[int, int], list[dict]] = {}
@@ -681,7 +813,7 @@ def excel_cells_from_page_grid(page: fitz.Page) -> dict:
         spans.append((span_start, len(x_lines) - 2))
         row_spans.append(spans)
         rows.append(row_cells)
-    return {"mode": "grid", "x_lines": x_lines, "y_lines": y_lines, "rows": rows, "spans": row_spans}
+    return {"mode": "grid", "strategy": strategy, "x_lines": x_lines, "y_lines": y_lines, "rows": rows, "spans": row_spans}
 
 
 def xlsx_color(rgb: tuple[int, int, int]) -> str:
@@ -825,6 +957,13 @@ def create_excel_from_refs(workdir: Path, refs: list[dict]) -> tuple[Path, str]:
                 abort(400, "Invalid page in preview")
             page = doc[page_number - 1]
             grid = excel_cells_from_page_grid(page)
+            logger.info(
+                "excel.page_strategy page=%s strategy=%s words=%s images=%s",
+                index,
+                grid.get("strategy", "unknown"),
+                len(page.get_text("words")),
+                len(page.get_images(full=True)),
+            )
             pages.append(
                 {
                     "name": f"Page {index}",
@@ -899,6 +1038,20 @@ def create_excel_from_refs(workdir: Path, refs: list[dict]) -> tuple[Path, str]:
                 for cell in row:
                     fmt = cell_format(int(cell.get("style", 0)), cell.get("color", (0, 0, 0)), border=False)
                     worksheet.write(row_offset + row_index, int(cell["col"]) - 1, cell["text"], fmt)
+
+        if grid["mode"] == "image" and grid.get("snapshot"):
+            worksheet.set_row(row_offset + 1, 360)
+            worksheet.insert_image(
+                row_offset + 1,
+                0,
+                "page.png",
+                {
+                    "image_data": io.BytesIO(grid["snapshot"]),
+                    "x_scale": 0.55,
+                    "y_scale": 0.55,
+                    "object_position": 1,
+                },
+            )
 
         for image in page_data["images"]:
             rect = image["rect"] * page_data["matrix"]

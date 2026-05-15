@@ -89,6 +89,8 @@ const statusBox = document.getElementById("status");
 const previewGrid = document.getElementById("previewGrid");
 const previewEmpty = document.getElementById("previewEmpty");
 const pageCount = document.getElementById("pageCount");
+let progressTimer = null;
+let progressValue = 0;
 
 async function ensureSession() {
   if (state.sessionId) return state.sessionId;
@@ -103,6 +105,87 @@ function setStatus(message, isError = false) {
   if (!statusBox) return;
   statusBox.textContent = message;
   statusBox.classList.toggle("error", isError);
+  if (isError) {
+    showProgressError(message);
+  } else if (!message) {
+    hideProgressPanel();
+  } else if (isGeneratingMessage(message)) {
+    showProgressPanel(message);
+  }
+}
+
+function isGeneratingMessage(message) {
+  return /generating|splitting|redacting|organizing/i.test(String(message || ""));
+}
+
+function progressElements() {
+  return {
+    modal: document.getElementById("progressModal"),
+    panel: document.querySelector("#progressModal .progress-panel"),
+    title: document.getElementById("progressTitle"),
+    fill: document.getElementById("progressFill"),
+    percent: document.getElementById("progressPercent"),
+    message: document.getElementById("progressMessage"),
+    close: document.getElementById("progressCloseBtn"),
+    button: document.getElementById("generateBtn"),
+  };
+}
+
+function setProgress(value) {
+  const { fill, percent } = progressElements();
+  progressValue = Math.max(0, Math.min(100, Math.round(value)));
+  if (fill) fill.style.width = `${progressValue}%`;
+  if (percent) percent.textContent = `${progressValue}%`;
+}
+
+function showProgressPanel(title) {
+  const { modal, panel, message, close, button } = progressElements();
+  if (!modal || !panel) return;
+  panel.classList.remove("error");
+  document.getElementById("progressTitle").textContent = title || "Generating output";
+  if (message) message.textContent = "Please keep this browser tab open while your file is prepared.";
+  if (close) close.hidden = true;
+  if (button) button.disabled = true;
+  modal.hidden = false;
+  setProgress(Math.max(progressValue, 8));
+  clearInterval(progressTimer);
+  progressTimer = setInterval(() => {
+    const increment = progressValue < 45 ? 7 : progressValue < 75 ? 4 : 1;
+    setProgress(Math.min(progressValue + increment, 94));
+  }, 450);
+}
+
+function hideProgressPanel() {
+  const { modal, button } = progressElements();
+  clearInterval(progressTimer);
+  progressTimer = null;
+  progressValue = 0;
+  if (modal) modal.hidden = true;
+  if (button) button.disabled = false;
+}
+
+function completeProgressPanel() {
+  const { button } = progressElements();
+  clearInterval(progressTimer);
+  progressTimer = null;
+  setProgress(100);
+  if (button) button.disabled = false;
+  window.setTimeout(hideProgressPanel, 250);
+}
+
+function showProgressError(message) {
+  const { modal, panel, title, fill, percent, message: body, close, button } = progressElements();
+  clearInterval(progressTimer);
+  progressTimer = null;
+  if (button) button.disabled = false;
+  if (!modal || !panel) return;
+  panel.classList.add("error");
+  if (title) title.textContent = "Unable to complete task";
+  if (fill) fill.style.width = "100%";
+  if (percent) percent.textContent = "Failed";
+  if (body) body.textContent = message || "Please review the file and try again.";
+  if (close) close.hidden = false;
+  modal.hidden = false;
 }
 
 function safeBrowserError(data, fallback) {
@@ -150,7 +233,11 @@ function showCompletionPanel(filename) {
 function handleCompletedDownload(res, blob) {
   const filename = filenameFromResponse(res, toolConfig[state.activeTool].output);
   downloadBlob(blob, filename);
-  setStatus("");
+  completeProgressPanel();
+  if (statusBox) {
+    statusBox.textContent = "";
+    statusBox.classList.remove("error");
+  }
   showCompletionPanel(filename);
 }
 
@@ -1645,6 +1732,7 @@ function setupToolPage() {
   document.getElementById("generateBtn").addEventListener("click", generateOutput);
   document.getElementById("clearPreviewBtn").addEventListener("click", () => clearPreview(true));
   document.getElementById("anotherTaskBtn")?.addEventListener("click", startAnotherTask);
+  document.getElementById("progressCloseBtn")?.addEventListener("click", hideProgressPanel);
 
   if (window.Sortable) {
     Sortable.create(previewGrid, {

@@ -38,6 +38,40 @@ def table_pdf_with_image() -> bytes:
     return data
 
 
+def aligned_table_pdf() -> bytes:
+    doc = fitz.open()
+    page = doc.new_page()
+    headers = [("Employee", 72), ("Department", 210), ("Contribution", 360)]
+    rows = [
+        ("Asha Rao", "Finance", "1200"),
+        ("Vikram Sen", "Security", "1350"),
+        ("Meera Das", "IT", "990"),
+    ]
+    for text, x in headers:
+        page.insert_text((x, 72), text, fontname="Helvetica-Bold", fontsize=11)
+    y = 96
+    for employee, department, amount in rows:
+        page.insert_text((72, y), employee, fontsize=10)
+        page.insert_text((210, y), department, fontsize=10)
+        page.insert_text((360, y), amount, fontsize=10)
+        y += 22
+    data = doc.tobytes(garbage=4, deflate=True)
+    doc.close()
+    return data
+
+
+def scanned_like_pdf() -> bytes:
+    red_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAAC0lEQVR4nGP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+    )
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_image(fitz.Rect(72, 72, 360, 216), stream=red_png)
+    data = doc.tobytes(garbage=4, deflate=True)
+    doc.close()
+    return data
+
+
 class SmokeTest(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -274,6 +308,56 @@ class SmokeTest(unittest.TestCase):
         self.assertIn("<b/>", styles)
         self.assertIn("xl/drawings/drawing1.xml", names)
         self.assertIn("xl/media/image1.png", names)
+
+    def test_generate_excel_keeps_aligned_columns(self):
+        upload = self.client.post(
+            "/api/document",
+            data={"sessionId": self.session_id, "file": (io.BytesIO(aligned_table_pdf()), "aligned.pdf")},
+            content_type="multipart/form-data",
+        )
+        document_id = upload.get_json()["documentId"]
+
+        converted = self.client.post(
+            "/api/generate/excel",
+            json={
+                "sessionId": self.session_id,
+                "pages": [{"documentId": document_id, "page": 1}],
+                "options": {},
+            },
+        )
+        self.assertEqual(converted.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(converted.data)) as workbook:
+            sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+            shared = workbook.read("xl/sharedStrings.xml").decode("utf-8")
+        self.assertIn("<t>Employee</t>", shared)
+        self.assertIn("<t>Department</t>", shared)
+        self.assertIn("<t>Contribution</t>", shared)
+        self.assertIn('r="A1"', sheet)
+        self.assertIn('r="B1"', sheet)
+        self.assertIn('r="C1"', sheet)
+
+    def test_generate_excel_preserves_scanned_page_as_image(self):
+        upload = self.client.post(
+            "/api/document",
+            data={"sessionId": self.session_id, "file": (io.BytesIO(scanned_like_pdf()), "scan.pdf")},
+            content_type="multipart/form-data",
+        )
+        document_id = upload.get_json()["documentId"]
+
+        converted = self.client.post(
+            "/api/generate/excel",
+            json={
+                "sessionId": self.session_id,
+                "pages": [{"documentId": document_id, "page": 1}],
+                "options": {},
+            },
+        )
+        self.assertEqual(converted.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(converted.data)) as workbook:
+            names = workbook.namelist()
+            shared = workbook.read("xl/sharedStrings.xml").decode("utf-8")
+        self.assertIn("no selectable table text", shared)
+        self.assertTrue(any(name.startswith("xl/media/image") for name in names))
 
     def test_generate_word_and_ppt_from_preview(self):
         upload = self.client.post(
